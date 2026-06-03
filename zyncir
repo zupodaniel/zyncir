@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# Build and/or launch the zyncir menu-bar app.
+#
+#   ./zyncir            # run as a background daemon (detached; survives closing
+#                       #   the terminal). Builds first only if artifacts are
+#                       #   missing. Logs go to a file.
+#   ./zyncir --build    # force a rebuild, then run ATTACHED to this shell so you
+#                       #   see logs live (Ctrl-C to quit).
+#   ./zyncir --stop     # stop a running daemon.
+#
+# ZYNCIR_JAR points the app at the freshly built helper jar so it always uses the
+# current device helper without re-embedding the bundle.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+JAR="android-helper/build/zyncir.jar"
+BIN="mac-app/.build/release/zyncird"
+LOG="${ZYNCIR_LOG:-$HOME/Library/Logs/zyncir.log}"
+PATTERN="release/zyncird"   # matches our running binary only
+
+running_pids() { pgrep -f "$PATTERN" || true; }
+
+case "${1:-}" in
+    --stop)
+        pids=$(running_pids)
+        if [ -n "$pids" ]; then
+            echo "==> Stopping zyncir (pid $pids)"
+            pkill -f "$PATTERN" || true
+        else
+            echo "zyncir is not running."
+        fi
+        exit 0
+        ;;
+    --build)
+        force_build=1
+        ;;
+    "")
+        force_build=0
+        ;;
+    *)
+        echo "usage: ./zyncir [--build | --stop]" >&2
+        exit 2
+        ;;
+esac
+
+if [ "$force_build" -eq 1 ] || [ ! -f "$JAR" ] || [ ! -x "$BIN" ]; then
+    echo "==> Building (this may take a moment)…"
+    ./build.sh
+fi
+
+if [ "$force_build" -eq 1 ]; then
+    # Attached: replace any running daemon and run in the foreground so logs
+    # stream to this terminal.
+    if [ -n "$(running_pids)" ]; then
+        echo "==> Replacing running daemon"
+        pkill -f "$PATTERN" || true
+        sleep 1
+    fi
+    echo "==> Launching zyncir (foreground; Ctrl-C to quit)…"
+    exec env ZYNCIR_JAR="$PWD/$JAR" "$BIN"
+else
+    # Daemon: detached from the terminal, survives its close, logs to a file.
+    if [ -n "$(running_pids)" ]; then
+        echo "zyncir is already running (pid $(running_pids)). Use ./zyncir --stop first, or --build to replace."
+        exit 0
+    fi
+    mkdir -p "$(dirname "$LOG")"
+    env ZYNCIR_JAR="$PWD/$JAR" nohup "$BIN" >>"$LOG" 2>&1 &
+    disown
+    echo "==> zyncir started in background (pid $!)."
+    echo "    logs:  tail -f \"$LOG\""
+    echo "    stop:  ./zyncir --stop"
+fi

@@ -1,0 +1,15 @@
+zyncir — macOS ↔ Android clipboard sync
+Copyright 2026 the zyncir authors
+
+This product includes software adapted from scrcpy
+(https://github.com/Genymobile/scrcpy), Copyright (C) 2018 Genymobile,
+licensed under the Apache License, Version 2.0.
+
+The following files in android-helper/ are adapted from scrcpy to obtain a
+real ClipboardManager under the shell UID (via a fabricated system Context):
+
+  - android-helper/src/com/zyncir/FakeContext.java
+  - android-helper/src/com/zyncir/Workarounds.java
+  - android-helper/src/com/zyncir/wrappers/ClipboardManager.java
+
+Apache-2.0 license headers are retained in those files.
