@@ -21,10 +21,14 @@ final class AppController: NSObject, NSApplicationDelegate {
     // menu updates live (NSMenu is otherwise a snapshot taken when it opens).
     private let menu = NSMenu()
     private var statusMenuItem: NSMenuItem!
-    private var reconnectItem: NSMenuItem!
+    private var selectItem: NSMenuItem!
     private var unpairItem: NSMenuItem!
     private var mirrorItem: NSMenuItem!
     private var mirrorSeparator: NSMenuItem!
+
+    // Count of selectable devices, refreshed by the autoconnect tick; shown on
+    // the "Select device" item.
+    private var availableDeviceCount = 0
 
     // MARK: - Lifecycle
 
@@ -94,6 +98,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         work.async { [weak self] in
             guard let self else { return }
             defer { self.connecting = false }
+
+            // List once; reuse it for the live device count (shown on the
+            // "Select device" item, updated even when nothing is paired) and for
+            // autoconnect below.
+            let devices = self.adb.listDevices()
+            let count = self.candidateDevices(from: devices).count
+            DispatchQueue.main.async {
+                if self.availableDeviceCount != count {
+                    self.availableDeviceCount = count
+                    self.refreshUI()
+                }
+            }
+
             // Read the target fresh: a device selection may have just changed it.
             guard let paired = self.paired else { return }
 
@@ -101,7 +118,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             // find our device among the connected transports (reliable, unlike
             // `adb mdns services`). bridge.start() is idempotent for the same
             // serial and switches transports if the selected device changed.
-            if let target = self.targetSerial(for: paired, devices: self.adb.listDevices()) {
+            if let target = self.targetSerial(for: paired, devices: devices) {
                 self.bridge.start(serial: target)
                 return
             }
@@ -189,16 +206,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         work.async { [weak self] in self?.chooseAndAdopt(preferWireless: false) }
     }
 
-    /// Runs on the `work` queue. Lists connected non-emulator devices, auto-picks
-    /// if there is exactly one, otherwise prompts, then stores the hardware serial.
-    private func chooseAndAdopt(preferWireless: Bool) {
-        let online = adb.listDevices().filter { $0.state == "device" && !$0.isEmulator }
-
-        // One physical phone can expose several transports. Offer USB and Wi-Fi as
-        // separate, selectable choices (keyed by model + kind), but collapse exact
-        // duplicates — e.g. a phone's IP:PORT and mDNS transports are both "Wi-Fi",
-        // so keep the stable mDNS one. (Selection is tag-bound, so identical titles
-        // are harmless, but this keeps the list clean.)
+    /// Collapse a raw `adb devices` list into selectable candidates: online,
+    /// non-emulator devices grouped by model + transport kind (USB vs Wi-Fi),
+    /// preferring the stable mDNS transport within Wi-Fi. One physical phone on
+    /// several transports counts once per kind — matching the picker and the
+    /// count shown on the menu item.
+    private func candidateDevices(from devices: [Adb.DeviceEntry]) -> [Adb.DeviceEntry] {
+        let online = devices.filter { $0.state == "device" && !$0.isEmulator }
         var groups: [String: Adb.DeviceEntry] = [:]
         var order: [String] = []
         for e in online {
@@ -211,7 +225,14 @@ final class AppController: NSObject, NSApplicationDelegate {
                 order.append(key)
             }
         }
-        let candidates = order.compactMap { groups[$0] }
+        return order.compactMap { groups[$0] }
+    }
+
+    /// Runs on the `work` queue. Lists connected non-emulator devices and always
+    /// presents the selection dialog (even for a single candidate), then stores
+    /// the chosen device's hardware serial.
+    private func chooseAndAdopt(preferWireless: Bool) {
+        let candidates = candidateDevices(from: adb.listDevices())
         NSLog("zyncir: device candidates: " + candidates.map { "\($0.displayName)[\($0.serial)]" }.joined(separator: ", "))
 
         guard !candidates.isEmpty else {
@@ -222,10 +243,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
 
-        if candidates.count == 1 {
-            adopt(entry: candidates[0])
-            return
-        }
+        // Always show the picker — never silently auto-adopt — so the choice is
+        // always visible, including when a single (possibly multi-transport)
+        // device is present.
         DispatchQueue.main.async {
             guard let chosen = self.promptForDevice(candidates, current: self.paired) else { return }
             self.work.async { self.adopt(entry: chosen) }
@@ -255,8 +275,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func reconnectNow() {
-        tickAutoConnect()
+    /// Run `adb kill-server`. Useful for clearing a wedged adb state. The bridge
+    /// connection drops with the server; autoconnect restarts it on the next tick.
+    @objc private func killAdbServer() {
+        work.async { [weak self] in
+            _ = try? self?.adb.run(["kill-server"])
+            NSLog("zyncir: adb kill-server")
+        }
     }
 
     /// Launch scrcpy against the current device, preferring its USB transport
@@ -337,7 +362,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         mirrorSeparator = NSMenuItem.separator()
         menu.addItem(mirrorSeparator)
 
-        let selectItem = NSMenuItem(title: "Select device…", action: #selector(selectDevice), keyEquivalent: "s")
+        selectItem = NSMenuItem(title: "Select device…", action: #selector(selectDevice), keyEquivalent: "s")
         selectItem.target = self
         menu.addItem(selectItem)
 
@@ -345,13 +370,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         pairItem.target = self
         menu.addItem(pairItem)
 
-        reconnectItem = NSMenuItem(title: "Reconnect now", action: #selector(reconnectNow), keyEquivalent: "r")
-        reconnectItem.target = self
-        menu.addItem(reconnectItem)
-
         unpairItem = NSMenuItem(title: "Forget device", action: #selector(unpair), keyEquivalent: "")
         unpairItem.target = self
         menu.addItem(unpairItem)
+
+        // Always visible — a global adb reset, useful regardless of pairing.
+        let killServerItem = NSMenuItem(title: "Kill adb server", action: #selector(killAdbServer), keyEquivalent: "")
+        killServerItem.target = self
+        menu.addItem(killServerItem)
 
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit zyncir", action: #selector(quit), keyEquivalent: "q")
@@ -378,10 +404,11 @@ final class AppController: NSObject, NSApplicationDelegate {
         statusMenuItem.title = statusText
 
         let hasPaired = (paired != nil)
-        reconnectItem.isHidden = !hasPaired
         unpairItem.isHidden = !hasPaired
         mirrorItem.isHidden = !hasPaired
         mirrorSeparator.isHidden = !hasPaired
+
+        selectItem.title = availableDeviceCount > 0 ? "Select device (\(availableDeviceCount))…" : "Select device…"
 
         // Reflect connection state in the menu-bar glyph.
         if let button = statusItem.button {
