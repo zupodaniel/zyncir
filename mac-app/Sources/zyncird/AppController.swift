@@ -157,17 +157,27 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     /// Find the connect service for the paired device, most specific first:
     /// exact mDNS instance name → instance name containing the hardware serial →
-    /// the sole connect service if exactly one is advertised (single-device case).
+    /// the sole connect service ONLY when we have no identity to match against
+    /// (legacy pairing). With a known serial/instance we must never blind-connect
+    /// to whatever single device happens to be advertising: if the paired device
+    /// drops and a *different* device is the only advertiser, that would connect
+    /// to the wrong phone while still showing the paired device's name.
     private func resolveConnectService(for paired: PairedDevice) -> MdnsService? {
         let connects = discovery.services(ofType: .connect)
-        if let exact = connects.first(where: { $0.instanceName == paired.mdnsInstanceName }) {
+        if !paired.mdnsInstanceName.isEmpty,
+           let exact = connects.first(where: { $0.instanceName == paired.mdnsInstanceName }) {
             return exact
         }
         if let serial = paired.serial,
            let bySerial = connects.first(where: { $0.instanceName.contains(serial) }) {
             return bySerial
         }
-        return connects.count == 1 ? connects.first : nil
+        // No identity captured → fall back to the sole advertiser; otherwise bail
+        // rather than risk connecting to the wrong device.
+        if paired.serial == nil && paired.mdnsInstanceName.isEmpty {
+            return connects.count == 1 ? connects.first : nil
+        }
+        return nil
     }
 
     // MARK: - Pairing & device selection
