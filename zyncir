@@ -1,22 +1,21 @@
 #!/usr/bin/env bash
 # Build and/or launch the zyncir menu-bar app.
 #
-#   ./zyncir            # run as a background daemon (detached; survives closing
-#                       #   the terminal). Builds first only if artifacts are
-#                       #   missing. Logs go to a file.
-#   ./zyncir --build    # force a rebuild, then run ATTACHED to this shell so you
-#                       #   see logs live (Ctrl-C to quit).
-#   ./zyncir --stop     # stop a running daemon.
+#   ./zyncir            # launch the app (builds first only if the .app is missing)
+#   ./zyncir --build    # force a rebuild, then (re)launch
+#   ./zyncir --stop     # stop the running app
 #
-# ZYNCIR_JAR points the app at the freshly built helper jar so it always uses the
-# current device helper without re-embedding the bundle.
+# zyncir must run as the signed .app bundle (via `open`), NOT the bare binary:
+# macOS Local Network Privacy only grants LAN access to the signed, bundled app,
+# which is what makes wireless adb work. Running the raw executable has no bundle
+# identity and would be silently blocked from the local network. Logs go to the
+# unified log; view them with:
+#   log stream --predicate 'process == "zyncird"' --info
 set -euo pipefail
 cd "$(dirname "$0")"
 
-JAR="android-helper/build/zyncir.jar"
-BIN="mac-app/.build/release/zyncird"
-LOG="${ZYNCIR_LOG:-$HOME/Library/Logs/zyncir.log}"
-PATTERN="release/zyncird"   # matches our running binary only
+APP="mac-app/.build/release/zyncir.app"
+PATTERN="zyncir.app/Contents/MacOS/zyncird"   # matches our running app only
 
 running_pids() { pgrep -f "$PATTERN" || true; }
 
@@ -43,31 +42,20 @@ case "${1:-}" in
         ;;
 esac
 
-if [ "$force_build" -eq 1 ] || [ ! -f "$JAR" ] || [ ! -x "$BIN" ]; then
+if [ "$force_build" -eq 1 ] || [ ! -d "$APP" ]; then
     echo "==> Building (this may take a moment)…"
     ./build.sh
 fi
 
-if [ "$force_build" -eq 1 ]; then
-    # Attached: replace any running daemon and run in the foreground so logs
-    # stream to this terminal.
-    if [ -n "$(running_pids)" ]; then
-        echo "==> Replacing running daemon"
-        pkill -f "$PATTERN" || true
-        sleep 1
-    fi
-    echo "==> Launching zyncir (foreground; Ctrl-C to quit)…"
-    exec env ZYNCIR_JAR="$PWD/$JAR" "$BIN"
-else
-    # Daemon: detached from the terminal, survives its close, logs to a file.
-    if [ -n "$(running_pids)" ]; then
-        echo "zyncir is already running (pid $(running_pids)). Use ./zyncir --stop first, or --build to replace."
-        exit 0
-    fi
-    mkdir -p "$(dirname "$LOG")"
-    env ZYNCIR_JAR="$PWD/$JAR" nohup "$BIN" >>"$LOG" 2>&1 &
-    disown
-    echo "==> zyncir started in background (pid $!)."
-    echo "    logs:  tail -f \"$LOG\""
-    echo "    stop:  ./zyncir --stop"
+# Stop any running instance so the freshly built bundle is the one that runs.
+if [ -n "$(running_pids)" ]; then
+    echo "==> Replacing running instance"
+    pkill -f "$PATTERN" || true
+    sleep 1
 fi
+
+echo "==> Launching zyncir"
+open "$APP"
+echo "    running: zyncir.app (menu-bar app)"
+echo "    logs:    log stream --predicate 'process == \"zyncird\"' --info"
+echo "    stop:    ./zyncir --stop"
