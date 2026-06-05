@@ -1,0 +1,12 @@
+# zyncir code-signing identity (local, not committed).
+#
+# Copy this file to `signing.local` (which is gitignored) and set CODESIGN_ID
+# to one of your Apple Development identities. zyncir must be signed with a
+# stable identity so macOS grants it Local Network access (needed for wireless
+# adb); the grant then persists across rebuilds.
+#
+# List your identities:
+#   security find-identity -v -p codesigning
+#
+# Then set the full name shown in quotes (including the team id in parentheses):
+export CODESIGN_ID="Apple Development: Your Name (TEAMID)"

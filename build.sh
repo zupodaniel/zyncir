@@ -33,12 +33,20 @@ cp mac-app/packaging/Info.plist "$APP/Contents/Info.plist"
 cp mac-app/packaging/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 echo "==> Code-signing (stable identity so the Local Network grant persists)"
-# Default to the personal Apple Development identity; override with CODESIGN_ID.
-CODESIGN_ID="${CODESIGN_ID:-$(security find-identity -v -p codesigning \
-  | awk -F'"' '/Apple Development: Daniel Zupo \(/{print $2; exit}')}"
-if [ -z "$CODESIGN_ID" ]; then
-    echo "ERROR: no 'Apple Development: Daniel Zupo' signing identity found." >&2
-    echo "       Set CODESIGN_ID to a valid identity and re-run." >&2
+# The signing identity is REQUIRED and provided locally — never committed.
+# Set it via the CODESIGN_ID env var, or in mac-app/packaging/signing.local
+# (gitignored; copy signing.local.example to start).
+[ -f mac-app/packaging/signing.local ] && source mac-app/packaging/signing.local
+if [ -z "${CODESIGN_ID:-}" ]; then
+    echo "ERROR: no code-signing identity set." >&2
+    echo "  zyncir must be signed so macOS grants it Local Network access" >&2
+    echo "  (required for wireless adb). Provide an Apple Development identity:" >&2
+    echo "    1) list yours:  security find-identity -v -p codesigning" >&2
+    echo "    2) set it, either:" >&2
+    echo "         cp mac-app/packaging/signing.local.example mac-app/packaging/signing.local" >&2
+    echo "         # then edit signing.local to set CODESIGN_ID" >&2
+    echo "       or: export CODESIGN_ID=\"Apple Development: Your Name (TEAMID)\"" >&2
+    echo "  See the README (Build section) for details." >&2
     exit 1
 fi
 echo "    identity: $CODESIGN_ID"

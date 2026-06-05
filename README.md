@@ -22,28 +22,50 @@ clipboard actually changes, so it does **not** poll or drain the battery.
 - **Android 15+** (API 35), with Developer Options → **Wireless debugging** enabled
 - **Android platform-tools** (`adb`) — the same one Android Studio uses
 - Xcode / Swift toolchain and the Android SDK (platform `android-35`, build-tools `35.0.0`) to build
+- An **Apple code-signing identity** (e.g. *Apple Development*) to sign the app.
+  This is required, not cosmetic: on **macOS 15+ (Sequoia/Tahoe)**, Local Network
+  Privacy only grants LAN access to a code-signed app, so wireless `adb connect`
+  is silently blocked for an unsigned build. List yours with
+  `security find-identity -v -p codesigning`.
 
 ## Build
 
 ```sh
+git clone https://github.com/zupodaniel/zyncir
+cd zyncir
+
+# Provide your code-signing identity (required). Either copy the template…
+cp mac-app/packaging/signing.local.example mac-app/packaging/signing.local
+#   …then edit signing.local and set CODESIGN_ID to your identity,
+# or just export it for this shell:
+export CODESIGN_ID="Apple Development: Your Name (TEAMID)"
+
 ./build.sh
 ```
 
-This builds `android-helper/build/zyncir.jar` (javac + d8, no Gradle), embeds
-it into the macOS app, and produces `mac-app/.build/release/zyncird`.
+This builds `android-helper/build/zyncir.jar` (javac + d8, no Gradle), embeds it
+into the macOS app, assembles a `.app` bundle, and **code-signs** it — producing
+`mac-app/.build/release/zyncir.app`. `signing.local` is gitignored, so your
+identity never lands in the repo.
 
 ## Run
 
-```sh
-mac-app/.build/release/zyncird
-```
+Open the built app in **Finder**: double-click
+`mac-app/.build/release/zyncir.app`, or move it to `/Applications` and launch it
+there. A clipboard glyph appears in the menu bar. Use **Pair new device (Wi-Fi)…**,
+enter the code shown on the phone's *Pair device with pairing code* screen, and
+you're done — it reconnects automatically thereafter. Quit from the menu's
+**Quit zyncir**.
 
-A clipboard glyph appears in the menu bar. Use **Pair device…**, enter the code
-shown on the phone's *Pair device with pairing code* screen, and you're done —
-it reconnects automatically thereafter.
+On the **first wireless connection**, macOS prompts *"zyncir would like to find
+devices on your local network"* — click **Allow** (required for wireless adb).
 
-> During development you can point the app at a freshly built jar without
-> rebuilding the bundle: `ZYNCIR_JAR=android-helper/build/zyncir.jar mac-app/.build/release/zyncird`
+> Launch it **as a bundle** (Finder, or `open zyncir.app`), not the raw
+> `Contents/MacOS/zyncird` binary — only the bundle carries the signed identity
+> the Local Network grant attaches to. (USB works either way.)
+>
+> Optional developer helper: `./zyncir` builds (if needed) and launches the app;
+> `./zyncir --build` forces a rebuild + relaunch; `./zyncir --stop` quits it.
 
 ## How it works
 
@@ -66,6 +88,10 @@ macOS menu-bar app                          Android 15+
   suppress echoes, so a copy does not ping-pong.
 - **Privacy:** clipboard content travels only over the local adb channel — never
   a cloud — and is **never written to logs** on either side.
+- **macOS Local Network:** the connection to the phone is made by the adb server
+  zyncir spawns; on macOS 15+ that requires Local Network permission, which is why
+  zyncir ships as a signed `.app` — the grant attaches to its identity and
+  persists across rebuilds.
 
 ## Coexistence with Android Studio / scrcpy
 
@@ -77,12 +103,25 @@ Designed to be a well-behaved adb citizen:
 - **Always `adb -s <serial> …`**, so it never hijacks the IDE's selected device
   or trips "more than one device" when the phone is also on USB.
 - Uses a unique `localabstract:zyncir` socket (scrcpy uses `scrcpy`) and an
-  OS-allocated forward port. It **never** calls `adb kill-server`; if the IDE
-  restarts the server, zyncir just reconnects.
+  OS-allocated forward port. It **never** kills the adb server on its own; if the
+  IDE restarts the server, zyncir just reconnects. (A manual **Kill adb server**
+  menu item is available for troubleshooting a wedged adb state.)
+
+## Menu
+
+The menu-bar item shows the connection status, the count of available devices,
+and these actions:
+
+- **Mirror screen (scrcpy)** — launch scrcpy against the connected device (shown when a device is paired).
+- **Select device (N)…** — pick which connected device to sync with; `N` is how many are available.
+- **Pair new device (Wi-Fi)…** — first-time Wireless-debugging pairing by code.
+- **Forget device** — clear the saved pairing (shown when a device is paired).
+- **Kill adb server** — run `adb kill-server` to recover a wedged adb state.
+- **Quit zyncir**.
 
 ## Functions
 
-- **Pairing:** phone → Wireless debugging → *Pair with code*; app → **Pair device…** → enter code.
+- **Pairing:** phone → Wireless debugging → *Pair with code*; app → **Pair new device (Wi-Fi)…** → enter code.
 - **Android → Mac:** copy text on the phone (app not focused); `pbpaste` on the Mac shows it within ~1 s.
 - **Mac → Android:** `pbcopy` on the Mac; paste into a phone text field.
 - **Loop guard:** copy once on each side; the value must not ping-pong or duplicate.
@@ -96,3 +135,8 @@ Designed to be a well-behaved adb citizen:
 
 Apache-2.0. The device helper adapts scrcpy's `FakeContext`, `Workarounds`, and
 `ClipboardManager` (Apache-2.0); see `NOTICE` and the per-file headers.
+
+## Author
+
+Created by **Daniel Zupo** — https://github.com/zupodaniel
+(project: https://github.com/zupodaniel/zyncir).
