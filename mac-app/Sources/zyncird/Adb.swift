@@ -104,6 +104,14 @@ struct Adb {
     /// Parse `adb devices -l`. This is the reliable signal for what is connected;
     /// modern adb auto-connects paired wireless devices, while `adb mdns services`
     /// often returns empty once a device is already connected.
+    /// Known device states adb reports in column 2 of `adb devices`. Used to find
+    /// the state column robustly, because a serial can itself contain a space when
+    /// mDNS renames a colliding instance (e.g. "adb-XXXX-YY (2)._adb-tls-connect._tcp").
+    private static let deviceStates: Set<String> = [
+        "device", "offline", "unauthorized", "authorizing", "connecting",
+        "bootloader", "recovery", "sideload", "host", "fastboot", "unknown",
+    ]
+
     func listDevices() -> [DeviceEntry] {
         guard let out = try? run(["devices", "-l"]) else { return [] }
         var result: [DeviceEntry] = []
@@ -112,12 +120,19 @@ struct Adb {
             if line.isEmpty || line.hasPrefix("List of") { continue }
             let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
                 .map(String.init).filter { !$0.isEmpty }
-            guard cols.count >= 2 else { continue }
+            // The serial is everything before the state column; the state is the
+            // first token that is a known adb state. This tolerates spaces inside
+            // the serial (mDNS "(2)" collision suffix), which a fixed column 0/1
+            // split would mangle into a bogus serial + state.
+            guard let stateIdx = cols.firstIndex(where: { Self.deviceStates.contains($0) }),
+                  stateIdx >= 1 else { continue }
+            let serial = cols[0..<stateIdx].joined(separator: " ")
+            let state = cols[stateIdx]
             var model: String?
-            for col in cols.dropFirst(2) where col.hasPrefix("model:") {
+            for col in cols[(stateIdx + 1)...] where col.hasPrefix("model:") {
                 model = String(col.dropFirst("model:".count))
             }
-            result.append(DeviceEntry(serial: cols[0], state: cols[1], model: model))
+            result.append(DeviceEntry(serial: serial, state: state, model: model))
         }
         return result
     }
