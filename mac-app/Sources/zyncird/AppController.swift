@@ -238,6 +238,24 @@ final class AppController: NSObject, NSApplicationDelegate {
         return order.compactMap { groups[$0] }
     }
 
+    /// Wireless devices grouped by identity (model, else serial), each with all of
+    /// its wireless transport serials. Backs the multi-select disconnect dialog —
+    /// `adb disconnect` only applies to wireless transports.
+    private func wirelessDeviceGroups(from devices: [Adb.DeviceEntry]) -> [(label: String, serials: [String])] {
+        let wireless = devices.filter { $0.state == "device" && !$0.isEmulator && $0.isWireless }
+        var groups: [String: (label: String, serials: [String])] = [:]
+        var order: [String] = []
+        for e in wireless {
+            let key = e.model ?? e.serial
+            if groups[key] == nil {
+                groups[key] = (label: e.displayName, serials: [])
+                order.append(key)
+            }
+            groups[key]?.serials.append(e.serial)
+        }
+        return order.compactMap { groups[$0] }
+    }
+
     /// Runs on the `work` queue. Lists connected non-emulator devices and always
     /// presents the selection dialog (even for a single candidate), then stores
     /// the chosen device's hardware serial.
@@ -285,12 +303,19 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Run `adb kill-server`. Useful for clearing a wedged adb state. The bridge
-    /// connection drops with the server; autoconnect restarts it on the next tick.
-    @objc private func killAdbServer() {
+    /// Kill the adb server and immediately restart it **from zyncir**, so the new
+    /// server's responsible app is the signed `zyncir.app` (and therefore carries
+    /// the Local Network grant wireless adb needs), then force a reconnect. Use
+    /// this to reclaim adb after a terminal/IDE respawned the server under an
+    /// unauthorized owner. Doing kill + start back-to-back here wins the race
+    /// against a terminal adb client respawning it first.
+    @objc private func restartAdbServer() {
         work.async { [weak self] in
-            _ = try? self?.adb.run(["kill-server"])
-            NSLog("zyncir: adb kill-server")
+            guard let self else { return }
+            _ = try? self.adb.run(["kill-server"])
+            _ = try? self.adb.run(["start-server"])
+            NSLog("zyncir: adb server restarted (owned by zyncir); forcing reconnect")
+            self.tickAutoConnect()
         }
     }
 
@@ -347,6 +372,54 @@ final class AppController: NSObject, NSApplicationDelegate {
         refreshUI()
     }
 
+    /// Multi-select disconnect: list wireless devices, `adb disconnect` the chosen
+    /// ones, and forget zyncir's pairing if its device was among them.
+    @objc private func disconnectDevices() {
+        work.async { [weak self] in
+            guard let self else { return }
+            let groups = self.wirelessDeviceGroups(from: self.adb.listDevices())
+            guard !groups.isEmpty else {
+                DispatchQueue.main.async {
+                    self.infoAlert("No wireless devices", "There are no wireless adb devices to disconnect.")
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                guard let selected = self.promptForDisconnect(groups), !selected.isEmpty else { return }
+                self.work.async {
+                    var ok: [String] = []
+                    var failed: [String] = []
+                    var forgetPaired = false
+                    let pairedHW = self.paired?.serial
+                    for idx in selected where idx >= 0 && idx < groups.count {
+                        let g = groups[idx]
+                        var anyOK = false
+                        for serial in g.serials {
+                            // run throws on a non-zero exit (e.g. "no such device").
+                            if (try? self.adb.run(["disconnect", serial])) != nil { anyOK = true }
+                            if let hw = pairedHW, serial.contains(hw) { forgetPaired = true }
+                        }
+                        if anyOK { ok.append(g.label) } else { failed.append(g.label) }
+                    }
+                    DispatchQueue.main.async {
+                        if forgetPaired {
+                            self.bridge.stop()
+                            self.paired = nil
+                            DeviceStore.clear()
+                        }
+                        self.refreshUI()
+                        var msg = ok.isEmpty ? "" : "Disconnected: \(ok.joined(separator: ", "))."
+                        if !failed.isEmpty {
+                            msg += (msg.isEmpty ? "" : "\n") + "Could not disconnect: \(failed.joined(separator: ", "))."
+                        }
+                        if forgetPaired { msg += "\nCleared the saved pairing for the synced device." }
+                        self.infoAlert("Disconnect devices", msg.isEmpty ? "Nothing was disconnected." : msg)
+                    }
+                }
+            }
+        }
+    }
+
     @objc private func quit() {
         NSApp.terminate(nil)
     }
@@ -384,10 +457,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         unpairItem.target = self
         menu.addItem(unpairItem)
 
-        // Always visible — a global adb reset, useful regardless of pairing.
-        let killServerItem = NSMenuItem(title: "Kill adb server", action: #selector(killAdbServer), keyEquivalent: "")
-        killServerItem.target = self
-        menu.addItem(killServerItem)
+        // Always visible — adb device management, useful regardless of pairing.
+        let disconnectItem = NSMenuItem(title: "Disconnect devices…", action: #selector(disconnectDevices), keyEquivalent: "")
+        disconnectItem.target = self
+        menu.addItem(disconnectItem)
+
+        // Always visible — reclaim the adb server under zyncir and reconnect.
+        let restartServerItem = NSMenuItem(title: "Restart adb server", action: #selector(restartAdbServer), keyEquivalent: "")
+        restartServerItem.target = self
+        menu.addItem(restartServerItem)
 
         menu.addItem(.separator())
         let quitItem = NSMenuItem(title: "Quit zyncir", action: #selector(quit), keyEquivalent: "q")
@@ -493,6 +571,37 @@ final class AppController: NSObject, NSApplicationDelegate {
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         let idx = popup.selectedItem?.tag ?? -1
         return (idx >= 0 && idx < candidates.count) ? candidates[idx] : nil
+    }
+
+    /// Multi-select checkbox dialog for disconnecting devices. Returns the selected
+    /// group indices, or nil if cancelled.
+    private func promptForDisconnect(_ groups: [(label: String, serials: [String])]) -> [Int]? {
+        let alert = NSAlert()
+        alert.messageText = "Disconnect devices from adb"
+        alert.informativeText = "Select wireless devices to disconnect (adb disconnect). They can reconnect later."
+        if let icon = symbolIcon("antenna.radiowaves.left.and.right") { alert.icon = icon }
+        alert.addButton(withTitle: "Disconnect")
+        alert.addButton(withTitle: "Cancel")
+
+        let rowH: CGFloat = 24
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 320, height: rowH * CGFloat(max(groups.count, 1))))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        var checks: [NSButton] = []
+        for (i, g) in groups.enumerated() {
+            let n = g.serials.count
+            let cb = NSButton(checkboxWithTitle: "\(g.label)  [\(n) transport\(n == 1 ? "" : "s")]",
+                              target: nil, action: nil)
+            cb.tag = i
+            stack.addArrangedSubview(cb)
+            checks.append(cb)
+        }
+        alert.accessoryView = stack
+
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        return checks.filter { $0.state == .on }.map { $0.tag }
     }
 
     /// Index of the candidate that represents the currently-synced device,

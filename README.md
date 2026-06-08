@@ -104,8 +104,9 @@ Designed to be a well-behaved adb citizen:
   or trips "more than one device" when the phone is also on USB.
 - Uses a unique `localabstract:zyncir` socket (scrcpy uses `scrcpy`) and an
   OS-allocated forward port. It **never** kills the adb server on its own; if the
-  IDE restarts the server, zyncir just reconnects. (A manual **Kill adb server**
-  menu item is available for troubleshooting a wedged adb state.)
+  IDE restarts the server, zyncir just reconnects. (A manual **Restart adb server**
+  menu item reclaims the server under zyncir and reconnects, if a terminal/IDE
+  respawned it under an owner without Local Network access.)
 
 ## Menu
 
@@ -116,7 +117,7 @@ and these actions:
 - **Select device (N)…** — pick which connected device to sync with; `N` is how many are available.
 - **Pair new device (Wi-Fi)…** — first-time Wireless-debugging pairing by code.
 - **Forget device** — clear the saved pairing (shown when a device is paired).
-- **Kill adb server** — run `adb kill-server` to recover a wedged adb state.
+- **Restart adb server** — kill the adb server and restart it *from zyncir* (so the new server is owned by the signed app and keeps Local Network access for wireless adb), then reconnect. Use it to reclaim adb after a terminal/IDE respawned the server.
 - **Quit zyncir**.
 
 ## Functions
