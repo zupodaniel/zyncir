@@ -150,4 +150,32 @@ struct Adb {
         try process.run()
         return process
     }
+
+    /// Switch a device's adbd to listen on a fixed TCP port (legacy `adb tcpip`),
+    /// so it can be reached at a stable, space-free `ip:port` afterward.
+    func tcpip(serial: String, port: Int) throws {
+        _ = try run(serial: serial, ["tcpip", "\(port)"])
+    }
+
+    /// Read a device's Wi-Fi IPv4 address over its current transport.
+    func deviceWifiIP(serial: String) -> String? {
+        if let out = try? run(serial: serial, ["shell", "ip", "-f", "inet", "addr", "show", "wlan0"]) {
+            for line in out.split(separator: "\n") {
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                if let i = parts.firstIndex(of: "inet"), i + 1 < parts.count,
+                   let ip = parts[i + 1].split(separator: "/").first {
+                    return String(ip)
+                }
+            }
+        }
+        if let out = try? run(serial: serial, ["shell", "ip", "route"]) {
+            for line in out.split(separator: "\n") where line.contains("wlan0") && line.contains("src") {
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                if let i = parts.firstIndex(of: "src"), i + 1 < parts.count {
+                    return String(parts[i + 1])
+                }
+            }
+        }
+        return nil
+    }
 }

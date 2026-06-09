@@ -23,6 +23,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var statusMenuItem: NSMenuItem!
     private var selectItem: NSMenuItem!
     private var unpairItem: NSMenuItem!
+    private var fixedPortItem: NSMenuItem!
     private var mirrorItem: NSMenuItem!
     private var mirrorSeparator: NSMenuItem!
 
@@ -123,7 +124,18 @@ final class AppController: NSObject, NSApplicationDelegate {
                 return
             }
 
-            // Fallback: nudge a connection via mDNS discovery if adb has not
+            // Fallback 1: re-establish the fixed-port endpoint (set via "Switch to
+            // fixed port") — its clean ip:port serial is preferred since it works
+            // everywhere. Only valid until the phone reboots out of tcpip mode.
+            if let host = paired.lastKnownHost {
+                _ = try? self.adb.run(["connect", host])
+                if let target = self.targetSerial(for: paired, devices: self.adb.listDevices()) {
+                    self.bridge.start(serial: target)
+                    return
+                }
+            }
+
+            // Fallback 2: nudge a connection via mDNS discovery if adb has not
             // auto-connected yet, then re-resolve to a stable transport serial.
             if let svc = self.resolveConnectService(for: paired) {
                 _ = try? self.adb.run(["connect", svc.endpoint])
@@ -137,6 +149,11 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// mDNS transport (`adb-<serial>-…`) over a USB or raw IP:port transport.
     private func targetSerial(for paired: PairedDevice, devices: [Adb.DeviceEntry]) -> String? {
         let online = devices.filter { $0.state == "device" }
+        // A fixed-port endpoint (set via "Switch to fixed port") is a clean ip:port
+        // serial that works everywhere, incl. scrcpy. Prefer it when connected.
+        if let host = paired.lastKnownHost, online.contains(where: { $0.serial == host }) {
+            return host
+        }
         guard let hw = paired.serial else {
             // Legacy pairing without a captured serial: only safe if there is a
             // single wireless transport to choose from.
@@ -144,8 +161,13 @@ final class AppController: NSObject, NSApplicationDelegate {
             return wireless.count == 1 ? wireless.first?.serial : nil
         }
         // The Wi-Fi (mDNS) transport name embeds the serial; the USB transport
-        // serial IS the hardware serial.
-        let wifi = online.first { $0.isMdnsTransport && $0.serial.contains(hw) }
+        // serial IS the hardware serial. Among Wi-Fi matches, prefer a space-free
+        // serial: an mDNS "(2)" collision suffix puts a space in the serial, which
+        // is malformed and breaks downstream tools (scrcpy can't target it), so we
+        // pick the clean transport whenever both the stale "(2)" and the canonical
+        // one are present.
+        let wifiMatches = online.filter { $0.isMdnsTransport && $0.serial.contains(hw) }
+        let wifi = wifiMatches.first { !$0.serial.contains(" ") } ?? wifiMatches.first
         let usb = online.first { !$0.isWireless && $0.serial == hw }
         // Honor the user's chosen transport, but fall back to the other if the
         // preferred one is not currently connected (e.g. cable unplugged).
@@ -319,6 +341,69 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Switch the paired device to a fixed adb port (5555) and reconnect via
+    /// ip:port. The clean ip:port serial works with scrcpy, unlike an mDNS
+    /// transport name that may carry a space (the "(2)/(3)" collision suffix).
+    /// Works over the current wireless transport — no USB needed. Resets when the
+    /// phone reboots out of tcpip mode (just run it again).
+    @objc private func switchToFixedPort() {
+        guard let paired = paired else {
+            infoAlert("No device selected", "Select a device first.")
+            return
+        }
+        establishFixedPort(for: paired) { [weak self] endpoint, err in
+            guard let self else { return }
+            if let endpoint {
+                self.infoAlert("On fixed port",
+                               "\(paired.label ?? "Device") is now reachable at \(endpoint). "
+                               + "scrcpy and sync use this clean address, and zyncir reconnects to it automatically.")
+            } else {
+                self.infoAlert("Couldn't connect on the fixed port", err ?? "Unknown error.")
+            }
+        }
+    }
+
+    /// Switch the paired device to a fixed adb port (5555) and connect via the
+    /// resulting clean ip:port. Persists the endpoint and delivers (endpoint, nil)
+    /// on success or (nil, errorMessage) on failure, on the main thread. Shared by
+    /// the menu action and the mirror retry.
+    private func establishFixedPort(for paired: PairedDevice, completion: @escaping (String?, String?) -> Void) {
+        work.async { [weak self] in
+            guard let self else { return }
+            func fail(_ msg: String) { DispatchQueue.main.async { completion(nil, msg) } }
+            guard let current = self.targetSerial(for: paired, devices: self.adb.listDevices()) else {
+                fail("Connect the device first, then try again."); return
+            }
+            guard let ip = self.adb.deviceWifiIP(serial: current) else {
+                fail("Couldn't read the phone's Wi‑Fi IP. Make sure Wi‑Fi is on, then retry."); return
+            }
+            do {
+                try self.adb.tcpip(serial: current, port: 5555)
+            } catch {
+                fail("\(error)"); return
+            }
+            // adbd restarts on the fixed port; give it a moment before connecting.
+            Thread.sleep(forTimeInterval: 1.5)
+            let endpoint = "\(ip):5555"
+            let result = ((try? self.adb.run(["connect", endpoint])) ?? "").lowercased()
+            NSLog("zyncir: fixed-port connect \(endpoint): \(result)")
+            if result.contains("connected to") {
+                var updated = paired
+                updated.lastKnownHost = endpoint
+                DispatchQueue.main.async {
+                    self.paired = updated
+                    DeviceStore.save(updated)
+                    self.tickAutoConnect()
+                    completion(endpoint, nil)
+                }
+            } else if result.contains("no route to host") {
+                fail("Allow zyncir under System Settings → Privacy & Security → Local Network, then try again.")
+            } else {
+                fail(result.isEmpty ? "Unknown error." : result)
+            }
+        }
+    }
+
     /// Launch scrcpy against the current device, preferring its USB transport
     /// (smoother than Wi-Fi) regardless of the clipboard transport pin.
     @objc private func mirrorScreen() {
@@ -345,13 +430,61 @@ final class AppController: NSObject, NSApplicationDelegate {
                 }
                 return
             }
-            do {
-                try Scrcpy.launch(path: scrcpy, adbPath: self.adb.path, serial: target)
-                NSLog("zyncir: launched scrcpy on \(target)")
-            } catch {
-                DispatchQueue.main.async { self.infoAlert("Could not start scrcpy", "\(error)") }
+            self.launchMirror(scrcpyPath: scrcpy, serial: target)
+        }
+    }
+
+    /// Launch scrcpy and watch for an *early* non-zero exit (a startup/connection
+    /// failure, not a normal window close). When the failing target is a wireless
+    /// mDNS serial — which scrcpy can't always use — offer to switch the device to
+    /// a fixed port and retry. Runs on the work queue.
+    private func launchMirror(scrcpyPath: String, serial: String) {
+        do {
+            let proc = try Scrcpy.launch(path: scrcpyPath, adbPath: adb.path, serial: serial)
+            NSLog("zyncir: launched scrcpy on \(serial)")
+            let startedAt = Date()
+            proc.terminationHandler = { [weak self] _ in
+                proc.terminationHandler = nil   // retain proc until exit, then break the cycle
+                guard let self,
+                      proc.terminationStatus != 0,
+                      Date().timeIntervalSince(startedAt) < 8,
+                      serial.hasPrefix("adb-") else { return }   // only the scrcpy-unfriendly mDNS case
+                DispatchQueue.main.async { self.offerFixedPortRetry(scrcpyPath: scrcpyPath) }
+            }
+        } catch {
+            DispatchQueue.main.async { self.infoAlert("Could not start scrcpy", "\(error)") }
+        }
+    }
+
+    /// After a wireless scrcpy failure, ask whether to switch to a fixed port and
+    /// retry mirroring. On confirm, establish the fixed port then relaunch scrcpy
+    /// against the clean ip:port (which won't re-trigger this prompt). Main thread.
+    private func offerFixedPortRetry(scrcpyPath: String) {
+        guard let paired = paired else { return }
+        guard confirmAlert(title: "Couldn't mirror over Wi‑Fi",
+                           message: "scrcpy couldn't connect to this wireless device — its adb name isn't scrcpy‑friendly. "
+                           + "Switch it to a fixed port (5555) and try mirroring again?",
+                           confirmTitle: "Switch & retry") else { return }
+        establishFixedPort(for: paired) { [weak self] endpoint, err in
+            guard let self else { return }
+            if let endpoint {
+                self.work.async { self.launchMirror(scrcpyPath: scrcpyPath, serial: endpoint) }
+            } else {
+                self.infoAlert("Couldn't switch to fixed port", err ?? "Unknown error.")
             }
         }
+    }
+
+    /// Two-button confirmation alert; returns true if the confirm button was hit.
+    private func confirmAlert(title: String, message: String, confirmTitle: String) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        if let icon = symbolIcon("rectangle.on.rectangle") { alert.icon = icon }
+        alert.addButton(withTitle: confirmTitle)
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     /// Like targetSerial, but always prefers USB for mirroring (better latency),
@@ -439,10 +572,20 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(statusMenuItem)
         menu.addItem(.separator())
 
+        // Connected-device actions — shown only when a device is paired.
+        fixedPortItem = NSMenuItem(title: "Switch to fixed port (5555)", action: #selector(switchToFixedPort), keyEquivalent: "")
+        fixedPortItem.target = self
+        menu.addItem(fixedPortItem)
+
         mirrorItem = NSMenuItem(title: "Mirror screen (scrcpy)", action: #selector(mirrorScreen), keyEquivalent: "m")
         mirrorItem.target = self
         menu.addItem(mirrorItem)
-        mirrorSeparator = NSMenuItem.separator()
+
+        unpairItem = NSMenuItem(title: "Forget device", action: #selector(unpair), keyEquivalent: "")
+        unpairItem.target = self
+        menu.addItem(unpairItem)
+
+        mirrorSeparator = NSMenuItem.separator()   // closes the connected-device group
         menu.addItem(mirrorSeparator)
 
         selectItem = NSMenuItem(title: "Select device…", action: #selector(selectDevice), keyEquivalent: "s")
@@ -453,14 +596,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         pairItem.target = self
         menu.addItem(pairItem)
 
-        unpairItem = NSMenuItem(title: "Forget device", action: #selector(unpair), keyEquivalent: "")
-        unpairItem.target = self
-        menu.addItem(unpairItem)
-
         // Always visible — adb device management, useful regardless of pairing.
         let disconnectItem = NSMenuItem(title: "Disconnect devices…", action: #selector(disconnectDevices), keyEquivalent: "")
         disconnectItem.target = self
         menu.addItem(disconnectItem)
+
+        menu.addItem(.separator())   // line above Restart adb server
 
         // Always visible — reclaim the adb server under zyncir and reconnect.
         let restartServerItem = NSMenuItem(title: "Restart adb server", action: #selector(restartAdbServer), keyEquivalent: "")
@@ -491,10 +632,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         statusMenuItem.title = statusText
 
-        let hasPaired = (paired != nil)
-        unpairItem.isHidden = !hasPaired
-        mirrorItem.isHidden = !hasPaired
-        mirrorSeparator.isHidden = !hasPaired
+        // These act on the live device, so enable them only when connected.
+        let connected = (bridgeState == .connected)
+        fixedPortItem.isEnabled = connected
+        mirrorItem.isEnabled = connected
+        // Forgetting only needs a stored pairing — allowed even when offline.
+        unpairItem.isEnabled = (paired != nil)
 
         selectItem.title = availableDeviceCount > 0 ? "Select device (\(availableDeviceCount))…" : "Select device…"
 

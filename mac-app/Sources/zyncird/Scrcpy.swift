@@ -32,9 +32,12 @@ enum Scrcpy {
         return nil
     }
 
-    /// Launch scrcpy detached against a specific device serial. It runs in its
-    /// own window until the user closes it; we do not wait on it.
-    static func launch(path: String, adbPath: String, serial: String) throws {
+    /// Launch scrcpy detached against a specific device serial. It runs in its own
+    /// window until the user closes it. The returned Process lets the caller watch
+    /// for an early non-zero exit (a startup/connection failure) via
+    /// `terminationHandler`; the caller owns its lifetime.
+    @discardableResult
+    static func launch(path: String, adbPath: String, serial: String) throws -> Process {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         // --no-clipboard-autosync: zyncir already owns clipboard sync; letting
@@ -46,5 +49,6 @@ enum Scrcpy {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
+        return process
     }
 }
