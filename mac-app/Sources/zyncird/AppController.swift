@@ -23,7 +23,6 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var statusMenuItem: NSMenuItem!
     private var selectItem: NSMenuItem!
     private var unpairItem: NSMenuItem!
-    private var fixedPortItem: NSMenuItem!
     private var mirrorItem: NSMenuItem!
     private var mirrorSeparator: NSMenuItem!
 
@@ -346,23 +345,6 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// transport name that may carry a space (the "(2)/(3)" collision suffix).
     /// Works over the current wireless transport — no USB needed. Resets when the
     /// phone reboots out of tcpip mode (just run it again).
-    @objc private func switchToFixedPort() {
-        guard let paired = paired else {
-            infoAlert("No device selected", "Select a device first.")
-            return
-        }
-        establishFixedPort(for: paired) { [weak self] endpoint, err in
-            guard let self else { return }
-            if let endpoint {
-                self.infoAlert("On fixed port",
-                               "\(paired.label ?? "Device") is now reachable at \(endpoint). "
-                               + "scrcpy and sync use this clean address, and zyncir reconnects to it automatically.")
-            } else {
-                self.infoAlert("Couldn't connect on the fixed port", err ?? "Unknown error.")
-            }
-        }
-    }
-
     /// Switch the paired device to a fixed adb port (5555) and connect via the
     /// resulting clean ip:port. Persists the endpoint and delivers (endpoint, nil)
     /// on success or (nil, errorMessage) on failure, on the main thread. Shared by
@@ -573,10 +555,6 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         // Connected-device actions — shown only when a device is paired.
-        fixedPortItem = NSMenuItem(title: "Switch to fixed port (5555)", action: #selector(switchToFixedPort), keyEquivalent: "")
-        fixedPortItem.target = self
-        menu.addItem(fixedPortItem)
-
         mirrorItem = NSMenuItem(title: "Mirror screen (scrcpy)", action: #selector(mirrorScreen), keyEquivalent: "m")
         mirrorItem.target = self
         menu.addItem(mirrorItem)
@@ -634,7 +612,6 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         // These act on the live device, so enable them only when connected.
         let connected = (bridgeState == .connected)
-        fixedPortItem.isEnabled = connected
         mirrorItem.isEnabled = connected
         // Forgetting only needs a stored pairing — allowed even when offline.
         unpairItem.isEnabled = (paired != nil)
