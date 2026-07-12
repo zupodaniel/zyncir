@@ -157,6 +157,69 @@ struct Adb {
         _ = try run(serial: serial, ["tcpip", "\(port)"])
     }
 
+    // MARK: - File transfer
+
+    /// Push a local file to the device.
+    func push(serial: String, local: String, remote: String) throws {
+        _ = try run(serial: serial, ["push", local, remote])
+    }
+
+    /// Pull a device file to a local path.
+    func pull(serial: String, remote: String, local: String) throws {
+        _ = try run(serial: serial, ["pull", remote, local])
+    }
+
+    /// Create the given device directories (idempotent).
+    func mkdirp(serial: String, paths: [String]) throws {
+        _ = try run(serial: serial, ["shell", "mkdir", "-p"] + paths.map(Self.shellQuote))
+    }
+
+    /// List the immediate entries of a device directory by name. Tolerates a
+    /// missing or empty directory (returns []). Filenames with a newline are not
+    /// representable here and are excluded — acceptable for a Downloads outbox.
+    /// Entries are names only; distinguishing files from directories is left to
+    /// `remoteStat` (toybox `ls` flag support varies, so we keep it to plain -1).
+    func listRemote(serial: String, dir: String) -> [String] {
+        // ls exits non-zero on a missing dir, which `run` turns into a throw we
+        // treat as "empty". Default ls omits "." / ".." and hidden entries.
+        guard let out = try? run(serial: serial, ["shell", "ls", "-1", Self.shellQuote(dir)]) else { return [] }
+        return out.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    /// Type + size of a device path in one `stat` call. Returns nil if the path
+    /// doesn't exist or stat is unavailable.
+    func remoteStat(serial: String, path: String) -> (isRegularFile: Bool, size: Int64)? {
+        // Quote the format too: unquoted, the device shell reads the "|" as a pipe.
+        guard let out = try? run(serial: serial, ["shell", "stat", "-c", Self.shellQuote("%F|%s"), Self.shellQuote(path)]) else { return nil }
+        let parts = out.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "|", maxSplits: 1)
+        guard parts.count == 2, let size = Int64(parts[1]) else { return nil }
+        return (parts[0] == "regular file", size)
+    }
+
+    /// Remove a single device file.
+    func removeRemote(serial: String, path: String) {
+        _ = try? run(serial: serial, ["shell", "rm", "-f", Self.shellQuote(path)])
+    }
+
+    /// Best-effort: ask the media scanner to index a pushed file so images/video
+    /// show up in Gallery/Photos. OEM-dependent and non-fatal; files under
+    /// /sdcard/Download are visible in the Files app without it.
+    func mediaScan(serial: String, path: String) {
+        _ = try? run(serial: serial, ["shell", "am", "broadcast",
+                                      "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+                                      "-d", Self.shellQuote("file://" + path)])
+    }
+
+    /// Single-quote a path for the device shell (`adb shell` concatenates its args
+    /// and re-parses them with the device's `sh`, so spaces/globs in a filename
+    /// would otherwise split or expand). `adb push`/`pull` do NOT go through the
+    /// shell, so their paths must be passed raw and are not quoted here.
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Read a device's Wi-Fi IPv4 address over its current transport.
     func deviceWifiIP(serial: String) -> String? {
         if let out = try? run(serial: serial, ["shell", "ip", "-f", "inet", "addr", "show", "wlan0"]) {

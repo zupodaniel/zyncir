@@ -9,6 +9,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var adb: Adb!
     private var discovery: MdnsDiscovery!
     private var bridge: ClipboardBridge!
+    private var fileTransfer: FileTransfer!
     private let work = DispatchQueue(label: "zyncir.autoconnect")
     private let pathMonitor = NWPathMonitor()
 
@@ -16,6 +17,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var bridgeState: ClipboardBridge.State = .stopped
     private var connecting = false
     private var autoTimer: Timer?
+    private let transferPanel = TransferProgressPanel()
 
     // Persistent menu and the items mutated on state changes, so an already-open
     // menu updates live (NSMenu is otherwise a snapshot taken when it opens).
@@ -24,6 +26,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var selectItem: NSMenuItem!
     private var unpairItem: NSMenuItem!
     private var mirrorItem: NSMenuItem!
+    private var sendFilesItem: NSMenuItem!
     private var mirrorSeparator: NSMenuItem!
 
     // Count of selectable devices, refreshed by the autoconnect tick; shown on
@@ -48,11 +51,32 @@ final class AppController: NSObject, NSApplicationDelegate {
         self.adb = adb
         self.discovery = MdnsDiscovery(adb: adb)
         self.bridge = ClipboardBridge(adb: adb, jarURL: jarURL)
+        self.fileTransfer = FileTransfer(adb: adb)
         self.paired = DeviceStore.load()
 
+        fileTransfer.didWritePasteboard = { [weak self] in
+            self?.bridge.suppressNextPasteboardChange()
+        }
+
+        transferPanel.onCancel = { [weak self] in self?.fileTransfer.cancelCurrentTransfer() }
+        fileTransfer.onTransferProgress = { [weak self] progress in
+            self?.transferPanel.update(progress)
+        }
+        fileTransfer.onTransferFinished = { [weak self] _, _ in
+            self?.transferPanel.hide()
+        }
+
         bridge.onStateChange = { [weak self] state in
-            self?.bridgeState = state
-            self?.refreshUI()
+            guard let self else { return }
+            self.bridgeState = state
+            // File transfer only makes sense against a live device: poll the
+            // outbox while connected, and stand down otherwise.
+            if state == .connected {
+                self.fileTransfer.startOutboxPolling()
+            } else {
+                self.fileTransfer.stopOutboxPolling()
+            }
+            self.refreshUI()
         }
 
         buildMenu()
@@ -119,7 +143,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             // `adb mdns services`). bridge.start() is idempotent for the same
             // serial and switches transports if the selected device changed.
             if let target = self.targetSerial(for: paired, devices: devices) {
-                self.bridge.start(serial: target)
+                self.startBridge(serial: target)
                 return
             }
 
@@ -129,7 +153,7 @@ final class AppController: NSObject, NSApplicationDelegate {
             if let host = paired.lastKnownHost {
                 _ = try? self.adb.run(["connect", host])
                 if let target = self.targetSerial(for: paired, devices: self.adb.listDevices()) {
-                    self.bridge.start(serial: target)
+                    self.startBridge(serial: target)
                     return
                 }
             }
@@ -139,9 +163,17 @@ final class AppController: NSObject, NSApplicationDelegate {
             if let svc = self.resolveConnectService(for: paired) {
                 _ = try? self.adb.run(["connect", svc.endpoint])
                 let target = self.targetSerial(for: paired, devices: self.adb.listDevices()) ?? svc.endpoint
-                self.bridge.start(serial: target)
+                self.startBridge(serial: target)
             }
         }
+    }
+
+    /// Start (or switch) the clipboard bridge and point file transfer at the same
+    /// serial. `bridge.start` and `fileTransfer.setSerial` are both idempotent and
+    /// hop to their own queues, so this is safe from the `work` queue.
+    private func startBridge(serial: String) {
+        bridge.start(serial: serial)
+        fileTransfer.setSerial(serial)
     }
 
     /// Pick the connected transport for the paired device. Prefers the stable
@@ -482,9 +514,23 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     @objc private func unpair() {
         bridge.stop()
+        fileTransfer.setSerial(nil)
         paired = nil
         DeviceStore.clear()
         refreshUI()
+    }
+
+    /// Pick files and push them to the device's Downloads/zyncir folder.
+    @objc private func sendFilesToDevice() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.prompt = "Send"
+        panel.message = "Choose file(s) to send to the device."
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        fileTransfer.sendFiles(panel.urls)
     }
 
     /// Multi-select disconnect: list wireless devices, `adb disconnect` the chosen
@@ -519,6 +565,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     DispatchQueue.main.async {
                         if forgetPaired {
                             self.bridge.stop()
+                            self.fileTransfer.setSerial(nil)
                             self.paired = nil
                             DeviceStore.clear()
                         }
@@ -558,6 +605,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         mirrorItem = NSMenuItem(title: "Mirror screen (scrcpy)", action: #selector(mirrorScreen), keyEquivalent: "m")
         mirrorItem.target = self
         menu.addItem(mirrorItem)
+
+        sendFilesItem = NSMenuItem(title: "Send file(s) to device…", action: #selector(sendFilesToDevice), keyEquivalent: "")
+        sendFilesItem.target = self
+        menu.addItem(sendFilesItem)
 
         unpairItem = NSMenuItem(title: "Forget device", action: #selector(unpair), keyEquivalent: "")
         unpairItem.target = self
@@ -613,6 +664,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         // These act on the live device, so enable them only when connected.
         let connected = (bridgeState == .connected)
         mirrorItem.isEnabled = connected
+        sendFilesItem.isEnabled = connected
         // Forgetting only needs a stored pairing — allowed even when offline.
         unpairItem.isEnabled = (paired != nil)
 

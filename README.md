@@ -1,10 +1,10 @@
 # zyncir — macOS ↔ Android - clipboard sync
 
 A focused menu-bar utility that keeps the **macOS** and **Android** clipboards in
-sync, both directions, over Wireless Debugging. Pair once; it auto-reconnects on
-the LAN whenever the phone is reachable. It does **one thing**: clipboard sync +
-autoconnect. File transfer, mirroring, and notifications are intentionally left
-to other tools (scrcpy, LocalSend, KDE Connect).
+sync, both directions, over Wireless Debugging — and moves files between the two.
+Pair once; it auto-reconnects on the LAN whenever the phone is reachable. It stays
+deliberately small: clipboard sync, simple file transfer, and autoconnect, with
+screen mirroring delegated to scrcpy.
 
 ## Why this exists
 
@@ -86,12 +86,35 @@ macOS menu-bar app                          Android 15+
 - **Helper launch:** `adb shell CLASSPATH=/data/local/tmp/zyncir.jar app_process / com.zyncir.Server`
 - **Loop guard:** both ends track the last value synced in each direction and
   suppress echoes, so a copy does not ping-pong.
-- **Privacy:** clipboard content travels only over the local adb channel — never
-  a cloud — and is **never written to logs** on either side.
+- **Privacy:** clipboard content and transferred files travel only over the local
+  adb channel — never a cloud — and file contents/names are **never written to
+  logs** on either side.
 - **macOS Local Network:** the connection to the phone is made by the adb server
   zyncir spawns; on macOS 15+ that requires Local Network permission, which is why
   zyncir ships as a signed `.app` — the grant attaches to its identity and
   persists across rebuilds.
+
+## File transfer
+
+Alongside the clipboard, zyncir moves whole files over the same adb connection
+(via `adb push`/`adb pull` — file bytes never touch the clipboard channel). Two
+device folders under Downloads are created automatically while connected:
+
+- `Download/zyncir/` — files **sent from the Mac** land here.
+- `Download/zyncir/send/` — drop a file here **on the phone** (Files app → *Move
+  to* / *Copy to*) to send it to the Mac.
+
+**Mac → Android:** menu **Send file(s) to device…** → pick one or more files;
+they're pushed to `Download/zyncir/` (a best-effort media scan makes images/video
+show up in Gallery).
+
+**Android → Mac:** while connected, zyncir watches `Download/zyncir/send/` (~2 s),
+pulls any new file into `~/Downloads` (never overwriting — it appends " (2)",
+" (3)", …), removes the device copy, drops the file on the Mac clipboard so you
+can paste it immediately, and posts a notification (tap it to reveal the file in
+Finder). Files larger than **100 MB** are not pulled automatically — a
+notification with a **Download** action surfaces them instead, so a large transfer
+stays behind an explicit tap.
 
 ## Coexistence with Android Studio / scrcpy
 
@@ -114,6 +137,7 @@ The menu-bar item shows the connection status, the count of available devices,
 and these actions:
 
 - **Mirror screen (scrcpy)** — launch scrcpy against the connected device (shown when a device is paired).
+- **Send file(s) to device…** — push chosen files to the device's `Download/zyncir/` folder (shown when connected).
 - **Select device (N)…** — pick which connected device to sync with; `N` is how many are available.
 - **Pair new device (Wi-Fi)…** — first-time Wireless-debugging pairing by code.
 - **Forget device** — clear the saved pairing (shown when a device is paired).
@@ -125,6 +149,8 @@ and these actions:
 - **Pairing:** phone → Wireless debugging → *Pair with code*; app → **Pair new device (Wi-Fi)…** → enter code.
 - **Android → Mac:** copy text on the phone (app not focused); `pbpaste` on the Mac shows it within ~1 s.
 - **Mac → Android:** `pbcopy` on the Mac; paste into a phone text field.
+- **Mac → Android files:** **Send file(s) to device…**, pick a file; it appears in the phone's Files app under `Download/zyncir/`.
+- **Android → Mac files:** move a file into `Download/zyncir/send/` on the phone; within ~2 s it lands in `~/Downloads` and on the Mac clipboard.
 - **Loop guard:** copy once on each side; the value must not ping-pong or duplicate.
 - **Autoconnect:** toggle the phone's Wi-Fi off/on; the app returns to *Connected* with no re-pairing.
 - **Restart resilience:** quit and relaunch the app; it reconnects automatically.

@@ -261,6 +261,15 @@ final class ClipboardBridge {
         send(text)
     }
 
+    /// Align the loop guard with the current pasteboard state so a change made by
+    /// something other than this bridge (e.g. a received file URL written by
+    /// FileTransfer) is not read on the next poll and re-sent to the device. Call
+    /// on the main thread, after the pasteboard write.
+    func suppressNextPasteboardChange() {
+        let pb = NSPasteboard.general
+        lastChangeCount = pb.changeCount
+    }
+
     /// device → Mac. Sets the pasteboard without re-sending it back.
     private func applyFromDevice(_ text: String) {
         if text == lastValue { return }   // loop guard
