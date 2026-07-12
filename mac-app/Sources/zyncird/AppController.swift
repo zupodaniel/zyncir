@@ -62,8 +62,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         fileTransfer.onTransferProgress = { [weak self] progress in
             self?.transferPanel.update(progress)
         }
-        fileTransfer.onTransferFinished = { [weak self] _, _ in
-            self?.transferPanel.hide()
+        fileTransfer.onTransferFinished = { [weak self] _, success in
+            self?.transferPanel.finish(success: success)
         }
 
         bridge.onStateChange = { [weak self] state in
