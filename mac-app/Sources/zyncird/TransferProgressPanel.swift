@@ -17,7 +17,7 @@ final class TransferProgressPanel: NSObject, NSWindowDelegate {
     private var panel: NSPanel?
     private var dismissWorkItem: DispatchWorkItem?
 
-    private let titleLabel = NSTextField(labelWithString: "")
+    private var titleLabel: NSTextField!
     private let percentLabel = NSTextField(labelWithString: "0%")
     private let statusLabel = NSTextField(labelWithString: "")
     private let iconView = NSImageView()
@@ -51,7 +51,7 @@ final class TransferProgressPanel: NSObject, NSWindowDelegate {
         bar.fraction = fraction
 
         if !panel.isVisible {
-            positionTopRight(panel)
+            GlassPanel.positionTopRight(panel)
             panel.orderFrontRegardless()
         }
     }
@@ -81,45 +81,6 @@ final class TransferProgressPanel: NSObject, NSWindowDelegate {
     // MARK: - Building
 
     private func buildPanel() -> NSPanel {
-        let p = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 480, height: 210),
-                        styleMask: [.titled, .closable, .fullSizeContentView, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
-        p.isFloatingPanel = true
-        p.level = .floating
-        p.hidesOnDeactivate = false
-        p.becomesKeyOnlyIfNeeded = true
-        p.isMovableByWindowBackground = true
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        p.titlebarAppearsTransparent = true
-        p.titleVisibility = .hidden
-        // Chromeless: hide all window buttons; the window stays draggable by its
-        // background (isMovableByWindowBackground) and Cancel is the sole control.
-        p.standardWindowButton(.closeButton)?.isHidden = true
-        p.standardWindowButton(.miniaturizeButton)?.isHidden = true
-        p.standardWindowButton(.zoomButton)?.isHidden = true
-        p.delegate = self
-
-        // Light-glass material that adapts to light/dark.
-        let effect = NSVisualEffectView()
-        effect.material = .windowBackground
-        effect.blendingMode = .behindWindow
-        effect.state = .active
-        p.contentView = effect
-
-        // Centered custom title in the 44px top strip (native title is hidden).
-        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        titleLabel.textColor = .secondaryLabelColor
-        titleLabel.alignment = .center
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(titleLabel)
-
-        // Hairline under the 44px title bar, so the title reads as its own region
-        // rather than floating over an undivided gap.
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        effect.addSubview(divider)
-
         let hero = buildHeroTile()
         let meta = buildMetaBlock()
         let topRow = NSStackView(views: [hero, meta])
@@ -133,24 +94,10 @@ final class TransferProgressPanel: NSObject, NSWindowDelegate {
         body.orientation = .vertical
         body.alignment = .leading
         body.spacing = 18
-        body.translatesAutoresizingMaskIntoConstraints = false
 
-        effect.addSubview(body)
+        let (p, title) = GlassPanel.make(delegate: self, body: body)
+        titleLabel = title
         NSLayoutConstraint.activate([
-            // Center the title within the 44px title bar (a tall label frame would
-            // top-align the text), with the hairline fixed at the bar's bottom.
-            titleLabel.centerYAnchor.constraint(equalTo: effect.topAnchor, constant: 22),
-            titleLabel.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            titleLabel.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-
-            divider.topAnchor.constraint(equalTo: effect.topAnchor, constant: 44),
-            divider.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            divider.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-
-            body.topAnchor.constraint(equalTo: effect.topAnchor, constant: 44 + 22),
-            body.leadingAnchor.constraint(equalTo: effect.leadingAnchor, constant: 24),
-            body.trailingAnchor.constraint(equalTo: effect.trailingAnchor, constant: -24),
-            body.bottomAnchor.constraint(equalTo: effect.bottomAnchor, constant: -20),
             topRow.leadingAnchor.constraint(equalTo: body.leadingAnchor),
             topRow.trailingAnchor.constraint(equalTo: body.trailingAnchor),
             progressRow.leadingAnchor.constraint(equalTo: body.leadingAnchor),
@@ -265,12 +212,6 @@ final class TransferProgressPanel: NSObject, NSWindowDelegate {
         let item = DispatchWorkItem { [weak self] in self?.panel?.orderOut(nil) }
         dismissWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
-    }
-
-    private func positionTopRight(_ panel: NSPanel) {
-        guard let vf = NSScreen.main?.visibleFrame else { return }
-        let size = panel.frame.size
-        panel.setFrameOrigin(NSPoint(x: vf.maxX - size.width - 16, y: vf.maxY - size.height - 16))
     }
 
     // MARK: - Formatting

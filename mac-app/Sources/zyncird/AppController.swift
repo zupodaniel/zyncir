@@ -18,6 +18,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var connecting = false
     private var autoTimer: Timer?
     private let transferPanel = TransferProgressPanel()
+    private let largeFilePanel = LargeFileDecisionPanel()
 
     // Persistent menu and the items mutated on state changes, so an already-open
     // menu updates live (NSMenu is otherwise a snapshot taken when it opens).
@@ -64,6 +65,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         fileTransfer.onTransferFinished = { [weak self] _, success in
             self?.transferPanel.finish(success: success)
+        }
+
+        largeFilePanel.onDownload = { [weak self] name in
+            self?.fileTransfer.receiveLargeFile(name: name)
+        }
+        fileTransfer.onLargeFileWaiting = { [weak self] name, size in
+            self?.largeFilePanel.enqueue(name: name, sizeBytes: size)
         }
 
         bridge.onStateChange = { [weak self] state in

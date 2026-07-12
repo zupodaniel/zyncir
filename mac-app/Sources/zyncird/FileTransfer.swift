@@ -37,16 +37,14 @@ final class FileTransfer: NSObject {
     /// Main thread only.
     private var revealByID: [String: URL] = [:]
 
-    /// Notification id → outbox file name to pull when its "Download" action is
-    /// tapped (used for files over the auto-pull cap). Main thread only.
-    private var largeFileByID: [String: String] = [:]
-
     /// Outbox file names already surfaced as over-cap, so the poll doesn't
-    /// re-notify every tick. Touched only on `ops`.
+    /// re-surface them every tick. Touched only on `ops`.
     private var notifiedLarge: Set<String> = []
 
-    private static let largeFileCategory = "ZYNCIR_LARGE_FILE"
-    private static let downloadAction = "ZYNCIR_DOWNLOAD"
+    /// Fired (main thread) when an incoming file exceeds the auto-download cap, so
+    /// the UI can present a persistent download/dismiss decision instead of an
+    /// easily-missed notification.
+    var onLargeFileWaiting: ((_ name: String, _ sizeBytes: Int64) -> Void)?
 
     /// Called on the main thread right after a received file is written to the
     /// pasteboard, so the clipboard bridge can suppress the resulting change.
@@ -97,10 +95,6 @@ final class FileTransfer: NSObject {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        let download = UNNotificationAction(identifier: Self.downloadAction, title: "Download", options: [])
-        let category = UNNotificationCategory(identifier: Self.largeFileCategory,
-                                              actions: [download], intentIdentifiers: [], options: [])
-        center.setNotificationCategories([category])
     }
 
     // MARK: - Connection lifecycle (called by AppController)
@@ -238,13 +232,13 @@ final class FileTransfer: NSObject {
         guard let stat = adb.remoteStat(serial: s, path: remote) else { return }
         guard stat.isRegularFile else { return }   // skip directories/specials
         if auto && stat.size > Self.autoPullMaxBytes {
-            // Don't auto-pull a large file; surface it once with a Download action
-            // so the transfer stays behind an explicit tap.
+            // Don't auto-pull a large file; surface it once for an explicit
+            // download decision so the transfer stays behind a deliberate choice.
             if !notifiedLarge.contains(name) {
                 notifiedLarge.insert(name)
-                let sizeText = ByteCountFormatter.string(fromByteCount: stat.size, countStyle: .file)
+                let size = stat.size
                 DispatchQueue.main.async { [weak self] in
-                    self?.postLargeFileNotification(name: name, sizeText: sizeText)
+                    self?.onLargeFileWaiting?(name, size)
                 }
             }
             return
@@ -395,16 +389,6 @@ final class FileTransfer: NSObject {
         postNotification(title: "Received from device", body: url.lastPathComponent, revealURL: url)
     }
 
-    private func postLargeFileNotification(name: String, sizeText: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "Large file waiting on device"
-        content.body = "\(name) (\(sizeText)) wasn’t downloaded automatically. Tap Download to receive it."
-        content.categoryIdentifier = Self.largeFileCategory
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        largeFileByID[request.identifier] = name
-        UNUserNotificationCenter.current().add(request)
-    }
-
     private func postNotification(title: String, body: String, revealURL: URL? = nil) {
         let content = UNMutableNotificationContent()
         content.title = title
@@ -427,10 +411,7 @@ extension FileTransfer: UNUserNotificationCenterDelegate {
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
         let id = response.notification.request.identifier
-        if let name = largeFileByID.removeValue(forKey: id) {
-            // Both the "Download" action and tapping the banner body pull the file.
-            receiveLargeFile(name: name)
-        } else if let url = revealByID.removeValue(forKey: id) {
+        if let url = revealByID.removeValue(forKey: id) {
             NSWorkspace.shared.activateFileViewerSelecting([url])
         }
         completionHandler()
