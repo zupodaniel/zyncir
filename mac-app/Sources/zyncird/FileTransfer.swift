@@ -2,17 +2,16 @@ import Foundation
 import AppKit
 import UserNotifications
 
-/// File transfer between the Mac and the paired device, layered on `adb push` /
-/// `adb pull`. Bytes travel through those separate adb processes, never over the
-/// clipboard bridge's socket.
+/// File transfer between the Mac and the paired device.
 ///
-/// Mac → device: `sendFiles` pushes into `/sdcard/Download/zyncir/`.
-/// device → Mac: while connected, a poll of `/sdcard/Download/zyncir/send/` pulls
-/// any new file into ~/Downloads, deletes the device copy, and drops the pulled
-/// file on the pasteboard so it can be pasted immediately.
+/// Mac → device: `sendFiles` pushes into `/sdcard/Download/zyncir/` via `adb push`.
+/// device → Mac: the share app streams files straight into ~/Downloads over the
+/// `zyncir-share` socket (reached via `adb forward`) — no device-side copy. It
+/// signals readiness with a tiny trigger file in `/sdcard/Download/zyncir/send/`,
+/// which the helper's watcher relays so the Mac connects and reads the stream.
 ///
-/// The active serial and all push/pull work live on `ops` (a serial queue), so
-/// rapid transfers queue rather than spawn unbounded adb processes.
+/// The active serial and all adb work live on `ops` (a serial queue), so rapid
+/// transfers queue rather than spawn unbounded adb processes.
 final class FileTransfer: NSObject {
 
     /// Files sent from the Mac land here (not polled).
@@ -25,10 +24,6 @@ final class FileTransfer: NSObject {
     /// device-side copy) over the `zyncir-share` socket. Not a real transfer.
     static let streamMarker = "__zyncir_stream_request__"
     static let streamSocket = "zyncir-share"
-    /// Don't auto-pull anything larger than this: a huge file dropped in the
-    /// outbox shouldn't silently start a long transfer. "Receive latest" ignores
-    /// the cap (an explicit request).
-    static let autoPullMaxBytes: Int64 = 100 * 1024 * 1024
 
     private let adb: Adb
     private let ops = DispatchQueue(label: "zyncir.filetransfer")
@@ -37,7 +32,7 @@ final class FileTransfer: NSObject {
     /// connect so the phone's share sheet gains a "zyncir" target.
     private let shareApkURL: URL?
     static let shareAppPackage = "com.zyncir.share"
-    static let shareAppVersionCode = 3
+    static let shareAppVersionCode = 4
     /// Serials whose share app has already been checked this session. On `ops`.
     private var ensuredShareApp: Set<String> = []
 
@@ -47,15 +42,6 @@ final class FileTransfer: NSObject {
     /// Notification id → file to reveal in Finder when the notification is tapped.
     /// Main thread only.
     private var revealByID: [String: URL] = [:]
-
-    /// Outbox file names already surfaced as over-cap, so the poll doesn't
-    /// re-surface them every tick. Touched only on `ops`.
-    private var notifiedLarge: Set<String> = []
-
-    /// Fired (main thread) when an incoming file exceeds the auto-download cap, so
-    /// the UI can present a persistent download/dismiss decision instead of an
-    /// easily-missed notification.
-    var onLargeFileWaiting: ((_ name: String, _ sizeBytes: Int64) -> Void)?
 
     /// Called on the main thread right after a received file is written to the
     /// pasteboard, so the clipboard bridge can suppress the resulting change.
@@ -223,18 +209,9 @@ final class FileTransfer: NSObject {
 
     // MARK: - device → Mac
 
-    /// Pull one over-cap outbox file on demand (from its notification's "Download"
-    /// action), ignoring the auto-pull size cap.
-    func receiveLargeFile(name: String) {
-        ops.async { [weak self] in
-            guard let self, let s = self.serial else { return }
-            self.pullAndConsume(serial: s, name: name, auto: false)
-        }
-    }
-
-    /// Cancel the in-flight pull (from the progress window). Terminating the adb
-    /// process makes the pull exit non-zero, so `pullAndConsume` treats it as a
-    /// failure: the partial `.part` is discarded and the device copy is kept.
+    /// Cancel the in-flight transfer from the progress window. For a direct
+    /// stream this closes the socket, unblocking the read loop so the partial is
+    /// discarded.
     func cancelCurrentTransfer() {
         pullLock.lock()
         let proc = currentPull
@@ -245,22 +222,16 @@ final class FileTransfer: NSObject {
         if let fd { close(fd) }   // unblocks the stream read loop
     }
 
+    /// Look for the share app's stream trigger in the drop and, if present,
+    /// receive the file(s) directly over the socket. Files are never copied to
+    /// the device; a plain file dropped into the folder by hand is ignored.
     private func drainOutbox() {
         ops.async { [weak self] in
             guard let self, let s = self.serial else { return }
             let names = self.adb.listRemote(serial: s, dir: Self.remoteOutbox)
-            // Forget over-cap flags for files no longer present (e.g. downloaded
-            // or removed), so a later file reusing the name is surfaced again.
-            self.notifiedLarge.formIntersection(names)
-            for name in names {
-                if name == Self.streamMarker {
-                    // A share app wants to stream directly — consume the trigger
-                    // and receive over the socket (no device-side copy).
-                    self.adb.removeRemote(serial: s, path: "\(Self.remoteOutbox)/\(name)")
-                    self.receiveStream(serial: s)
-                } else {
-                    self.pullAndConsume(serial: s, name: name, auto: true)
-                }
+            for name in names where name == Self.streamMarker {
+                self.adb.removeRemote(serial: s, path: "\(Self.remoteOutbox)/\(name)")
+                self.receiveStream(serial: s)
             }
         }
     }
@@ -402,82 +373,6 @@ final class FileTransfer: NSObject {
         var v: UInt64 = 0
         for b in d { v = (v << 8) | UInt64(b) }
         return Int64(bitPattern: v)
-    }
-
-    /// Runs on `ops`. Pulls one outbox entry, then deletes the device copy only
-    /// after verifying the local file exists. Non-files are ignored; oversized
-    /// files are skipped during auto-pull.
-    private func pullAndConsume(serial s: String, name rawName: String, auto: Bool) {
-        // A listing entry should be a bare filename; guard against separators so a
-        // hostile name can't escape the outbox.
-        let name = (rawName as NSString).lastPathComponent
-        guard !name.isEmpty, name != ".", name != ".." else { return }
-        let remote = "\(Self.remoteOutbox)/\(name)"
-
-        guard let stat = adb.remoteStat(serial: s, path: remote) else { return }
-        guard stat.isRegularFile else { return }   // skip directories/specials
-        if auto && stat.size > Self.autoPullMaxBytes {
-            // Don't auto-pull a large file; surface it once for an explicit
-            // download decision so the transfer stays behind a deliberate choice.
-            if !notifiedLarge.contains(name) {
-                notifiedLarge.insert(name)
-                let size = stat.size
-                DispatchQueue.main.async { [weak self] in
-                    self?.onLargeFileWaiting?(name, size)
-                }
-            }
-            return
-        }
-
-        let total = stat.size
-        let dest = Self.uniqueDownloadURL(for: name)
-        // Pull into a sibling ".part" file so an interrupted transfer never looks
-        // like a finished download, and so the device copy is deleted ONLY after
-        // the pulled size is verified against the device size.
-        let part = dest.appendingPathExtension("part")
-        try? FileManager.default.removeItem(at: part)
-
-        let proc: Process
-        do {
-            proc = try adb.launch(serial: s, ["pull", remote, part.path])
-        } catch {
-            NSLog("zyncir: pull launch failed: \(error)")
-            return
-        }
-        pullLock.lock(); currentPull = proc; pullLock.unlock()
-        if total >= Self.progressUIMinBytes {
-            let partPath = part.path
-            DispatchQueue.main.async { [weak self] in
-                self?.startProgress(name: name, total: total, incoming: true) {
-                    Self.fileSize(atPath: partPath)
-                }
-            }
-        }
-        proc.waitUntilExit()
-        pullLock.lock(); currentPull = nil; pullLock.unlock()
-        DispatchQueue.main.async { [weak self] in self?.stopProgress() }
-
-        let pulled = Self.fileSize(atPath: part.path)
-        guard proc.terminationStatus == 0, let got = pulled, got == total else {
-            NSLog("zyncir: pull incomplete (status \(proc.terminationStatus), got \(pulled.map(String.init) ?? "nil") of \(total)); keeping device copy")
-            try? FileManager.default.removeItem(at: part)
-            DispatchQueue.main.async { [weak self] in self?.onTransferFinished?(name, false) }
-            return
-        }
-        do {
-            try FileManager.default.moveItem(at: part, to: dest)
-        } catch {
-            NSLog("zyncir: finalize rename failed: \(error); keeping device copy")
-            try? FileManager.default.removeItem(at: part)
-            DispatchQueue.main.async { [weak self] in self?.onTransferFinished?(name, false) }
-            return
-        }
-        adb.removeRemote(serial: s, path: remote)
-        notifiedLarge.remove(name)
-        DispatchQueue.main.async { [weak self] in
-            self?.onTransferFinished?(name, true)
-            self?.placeOnPasteboardAndNotify(dest)
-        }
     }
 
     private static func fileSize(atPath path: String) -> Int64? {

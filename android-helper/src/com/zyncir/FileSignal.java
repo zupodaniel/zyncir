@@ -37,14 +37,27 @@ public final class FileSignal {
         startObserver();
     }
 
-    private void startObserver() {
-        // CLOSE_WRITE covers direct writes (manual drops); MOVED_TO covers the
-        // MediaStore finalize (rename from ".pending-…" to the real name). Both
-        // signal a *complete* file; we never fire on the pending/trashed dotfiles.
+    private synchronized void startObserver() {
+        if (observer != null) {
+            try { observer.stopWatching(); } catch (Exception ignored) {}
+        }
+        new File(STAGING).mkdirs();
+        // CLOSE_WRITE covers direct writes; MOVED_TO covers the MediaStore finalize
+        // (rename from ".pending-…" to the real name) — both signal a *complete*
+        // file. DELETE_SELF/MOVE_SELF let us re-watch if the drop is deleted out
+        // from under us (an inotify watch is pinned to the inode, so a delete +
+        // recreate would otherwise silently stop delivering events).
         observer = new FileObserver(new File(STAGING),
-                FileObserver.CLOSE_WRITE | FileObserver.MOVED_TO) {
+                FileObserver.CLOSE_WRITE | FileObserver.MOVED_TO
+                        | FileObserver.DELETE_SELF | FileObserver.MOVE_SELF) {
             @Override
             public void onEvent(int event, String path) {
+                int e = event & FileObserver.ALL_EVENTS;
+                if (e == FileObserver.DELETE_SELF || e == FileObserver.MOVE_SELF) {
+                    Log.i("file signal: drop removed — re-watching");
+                    startObserver();
+                    return;
+                }
                 if (path == null || path.startsWith(".")) return;
                 nudge(path);
             }

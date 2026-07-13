@@ -45,6 +45,7 @@ public final class ShareService extends Service {
 
     private static final String CHANNEL = "zyncir-transfer";
     private static final int NOTIF_ID = 1;
+    private static final long ACCEPT_TIMEOUT_MS = 30_000;
     private static final String TAG = "zyncir-share";
 
     private final List<Uri> queue = new ArrayList<>();
@@ -73,11 +74,31 @@ public final class ShareService extends Service {
     }
 
     private void run() {
-        LocalServerSocket server = null;
+        final LocalServerSocket server;
         try {
             server = new LocalServerSocket(SOCKET_NAME);
+        } catch (Exception e) {
+            Log.e(TAG, "bind failed", e);
+            stopForeground(true);
+            stopSelf();
+            return;
+        }
+        // Don't hang forever if the Mac never connects (e.g. it's not running):
+        // a watchdog closes the socket, which makes accept() throw.
+        final boolean[] connected = {false};
+        Thread watchdog = new Thread(() -> {
+            try { Thread.sleep(ACCEPT_TIMEOUT_MS); } catch (InterruptedException ignored) {}
+            if (!connected[0]) {
+                Log.i(TAG, "no Mac connection within timeout — giving up");
+                closeQuietly(server);
+            }
+        });
+        watchdog.setDaemon(true);
+        watchdog.start();
+        try {
             writeMarker();                       // nudge the Mac to connect
             LocalSocket client = server.accept(); // Mac connects via adb forward
+            connected[0] = true;
             Log.i(TAG, "Mac connected; streaming");
             List<Uri> batch;
             synchronized (queue) {
@@ -90,6 +111,7 @@ public final class ShareService extends Service {
         } catch (Exception e) {
             Log.e(TAG, "stream failed", e);
         } finally {
+            watchdog.interrupt();
             closeQuietly(server);
             stopForeground(true);
             stopSelf();
