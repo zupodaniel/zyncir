@@ -7,8 +7,12 @@ cd "$(dirname "$0")"
 echo "==> Building Android helper"
 ( cd android-helper && ./build.sh )
 
-echo "==> Embedding helper jar into the macOS app resources"
+echo "==> Building Android share app"
+( cd android-share && ./build.sh )
+
+echo "==> Embedding helper jar + share APK into the macOS app resources"
 cp android-helper/build/zyncir.jar mac-app/Sources/zyncird/Resources/zyncir.jar
+cp android-share/build/zyncir-share.apk mac-app/Sources/zyncird/Resources/zyncir-share.apk
 
 echo "==> Building macOS app"
 ( cd mac-app && swift build -c release )

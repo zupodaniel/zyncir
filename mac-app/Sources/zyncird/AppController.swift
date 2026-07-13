@@ -19,6 +19,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var autoTimer: Timer?
     private let transferPanel = TransferProgressPanel()
     private let largeFilePanel = LargeFileDecisionPanel()
+    private var fileSignal: FileSignalClient!
+    private var connectedSerial: String?
 
     // Persistent menu and the items mutated on state changes, so an already-open
     // menu updates live (NSMenu is otherwise a snapshot taken when it opens).
@@ -52,7 +54,9 @@ final class AppController: NSObject, NSApplicationDelegate {
         self.adb = adb
         self.discovery = MdnsDiscovery(adb: adb)
         self.bridge = ClipboardBridge(adb: adb, jarURL: jarURL)
-        self.fileTransfer = FileTransfer(adb: adb)
+        self.fileTransfer = FileTransfer(adb: adb, shareApkURL: Self.resolveShareApkURL())
+        self.fileSignal = FileSignalClient(adb: adb)
+        self.fileSignal.onSignal = { [weak self] in self?.fileTransfer.triggerDrain() }
         self.paired = DeviceStore.load()
 
         fileTransfer.didWritePasteboard = { [weak self] in
@@ -77,12 +81,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         bridge.onStateChange = { [weak self] state in
             guard let self else { return }
             self.bridgeState = state
-            // File transfer only makes sense against a live device: poll the
-            // outbox while connected, and stand down otherwise.
+            // File transfer only makes sense against a live device: watch for the
+            // helper's "file ready" signal while connected (and pull once now to
+            // catch anything already staged), and stand down otherwise.
             if state == .connected {
-                self.fileTransfer.startOutboxPolling()
+                if let s = self.connectedSerial { self.fileSignal.start(serial: s) }
+                self.fileTransfer.triggerDrain()
             } else {
-                self.fileTransfer.stopOutboxPolling()
+                self.fileSignal.stop()
             }
             self.refreshUI()
         }
@@ -103,6 +109,14 @@ final class AppController: NSObject, NSApplicationDelegate {
             return URL(fileURLWithPath: p)
         }
         return Bundle.module.url(forResource: "zyncir", withExtension: "jar")
+    }
+
+    private static func resolveShareApkURL() -> URL? {
+        if let p = ProcessInfo.processInfo.environment["ZYNCIR_SHARE_APK"],
+           FileManager.default.fileExists(atPath: p) {
+            return URL(fileURLWithPath: p)
+        }
+        return Bundle.module.url(forResource: "zyncir-share", withExtension: "apk")
     }
 
     // MARK: - Autoconnect engine
@@ -180,6 +194,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// serial. `bridge.start` and `fileTransfer.setSerial` are both idempotent and
     /// hop to their own queues, so this is safe from the `work` queue.
     private func startBridge(serial: String) {
+        connectedSerial = serial
         bridge.start(serial: serial)
         fileTransfer.setSerial(serial)
     }

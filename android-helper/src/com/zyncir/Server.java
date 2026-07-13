@@ -64,6 +64,10 @@ public final class Server {
         acceptThread.setDaemon(false);
         acceptThread.start();
 
+        // Watches the staging drop and nudges the Mac to pull, on its own socket
+        // so the clipboard protocol is untouched.
+        new FileSignal().start();
+
         Log.i("zyncir helper started (event-driven, socket=" + SOCKET_NAME + ")");
         Looper.loop();
     }

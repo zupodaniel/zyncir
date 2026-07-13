@@ -21,7 +21,10 @@ clipboard actually changes, so it does **not** poll or drain the battery.
 - **macOS 13+**
 - **Android 15+** (API 35), with Developer Options → **Wireless debugging** enabled
 - **Android platform-tools** (`adb`) — the same one Android Studio uses
-- Xcode / Swift toolchain and the Android SDK (platform `android-35`, build-tools `35.0.0`) to build
+- Xcode / Swift toolchain, a JDK, and the Android SDK to build — platforms
+  `android-35` (helper jar) and `android-36` (the "Share to zyncir" app, which
+  targets API 36), plus build-tools `35.0.0` (provides `d8`, `aapt2`, `zipalign`,
+  `apksigner`)
 - An **Apple code-signing identity** (e.g. *Apple Development*) to sign the app.
   This is required, not cosmetic: on **macOS 15+ (Sequoia/Tahoe)**, Local Network
   Privacy only grants LAN access to a code-signed app, so wireless `adb connect`
@@ -43,8 +46,16 @@ export CODESIGN_ID="Apple Development: Your Name (TEAMID)"
 ./build.sh
 ```
 
-This builds `android-helper/build/zyncir.jar` (javac + d8, no Gradle), embeds it
-into the macOS app, assembles a `.app` bundle, and **code-signs** it — producing
+This builds two Android artifacts (no Gradle) and embeds both into the macOS app:
+
+- `android-helper/build/zyncir.jar` — the clipboard/file-signal helper (javac + d8).
+- `android-share/build/zyncir-share.apk` — the "Share to zyncir" share-sheet app
+  (javac + d8 + aapt2 + zipalign + apksigner). On the first build it auto-creates
+  a debug keystore at `android-share/zyncir-debug.keystore` (gitignored) to sign
+  the APK; zyncir installs/updates this APK onto the paired device automatically
+  on connect, so "zyncir" appears in the phone's share sheet.
+
+It then assembles a `.app` bundle and **code-signs** it — producing
 `mac-app/.build/release/zyncir.app`. `signing.local` is gitignored, so your
 identity never lands in the repo.
 

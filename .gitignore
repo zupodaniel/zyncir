@@ -1,4 +1,7 @@
 android-helper/build/
+android-share/build/
+android-share/zyncir-debug.keystore
 mac-app/.build/
 mac-app/Sources/zyncird/Resources/zyncir.jar
+mac-app/Sources/zyncird/Resources/zyncir-share.apk
 mac-app/packaging/signing.local

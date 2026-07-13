@@ -10,7 +10,8 @@ let package = Package(
         .executableTarget(
             name: "zyncird",
             resources: [
-                .copy("Resources/zyncir.jar")
+                .copy("Resources/zyncir.jar"),
+                .copy("Resources/zyncir-share.apk")
             ]
         )
     ]

@@ -21,6 +21,10 @@ final class FileTransfer: NSObject {
     /// them to the Mac. A separate subfolder so a Mac→device push never echoes
     /// back as a device→Mac pull.
     static let remoteOutbox = "/sdcard/Download/zyncir/send"
+    /// Reserved trigger file the share app drops to request a direct stream (no
+    /// device-side copy) over the `zyncir-share` socket. Not a real transfer.
+    static let streamMarker = "__zyncir_stream_request__"
+    static let streamSocket = "zyncir-share"
     /// Don't auto-pull anything larger than this: a huge file dropped in the
     /// outbox shouldn't silently start a long transfer. "Receive latest" ignores
     /// the cap (an explicit request).
@@ -28,7 +32,14 @@ final class FileTransfer: NSObject {
 
     private let adb: Adb
     private let ops = DispatchQueue(label: "zyncir.filetransfer")
-    private var pollTimer: Timer?
+
+    /// The bundled "Share to zyncir" companion APK, installed/updated over adb on
+    /// connect so the phone's share sheet gains a "zyncir" target.
+    private let shareApkURL: URL?
+    static let shareAppPackage = "com.zyncir.share"
+    static let shareAppVersionCode = 3
+    /// Serials whose share app has already been checked this session. On `ops`.
+    private var ensuredShareApp: Set<String> = []
 
     /// The serial of the currently-synced transport, or nil. Touched only on `ops`.
     private var serial: String?
@@ -75,6 +86,10 @@ final class FileTransfer: NSObject {
     /// `waitUntilExit` for the duration of the transfer).
     private let pullLock = NSLock()
     private var currentPull: Process?
+    /// The in-flight direct-stream socket fd and its cancel flag (guarded by
+    /// `pullLock`, since Cancel comes from the main thread).
+    private var currentStreamFD: Int32?
+    private var streamCancelled = false
 
     // Progress-sampling state — mutated on the main thread; `progressSampler` is
     // invoked on `sampleQueue` so a device-side stat never blocks the main thread.
@@ -89,8 +104,9 @@ final class FileTransfer: NSObject {
     private var lastSampleTime: Date?
     private var emaRate: Double = 0
 
-    init(adb: Adb) {
+    init(adb: Adb, shareApkURL: URL?) {
         self.adb = adb
+        self.shareApkURL = shareApkURL
         super.init()
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -109,22 +125,42 @@ final class FileTransfer: NSObject {
             // Create the folders once per (re)connection, not on every tick.
             if changed, let s = newSerial {
                 try? self.adb.mkdirp(serial: s, paths: [Self.remoteInbox, Self.remoteOutbox])
+                self.ensureShareApp(serial: s)
             }
         }
     }
 
-    func startOutboxPolling() {
-        stopOutboxPolling()
-        let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
-            self?.drainOutbox()
+    /// Install (or update) the "Share to zyncir" companion APK on the device the
+    /// first time we see a serial this session. Runs on `ops` (install is slow).
+    private func ensureShareApp(serial s: String) {
+        guard let apk = shareApkURL, !ensuredShareApp.contains(s) else { return }
+        ensuredShareApp.insert(s)
+        let installed = installedShareVersion(serial: s)
+        if installed == nil || installed! < Self.shareAppVersionCode {
+            NSLog("zyncir: installing share app on \(s) (installed=\(installed.map(String.init) ?? "none"))")
+            _ = try? adb.run(serial: s, ["install", "-r", apk.path])
         }
-        RunLoop.main.add(timer, forMode: .common)
-        pollTimer = timer
     }
 
-    func stopOutboxPolling() {
-        pollTimer?.invalidate()
-        pollTimer = nil
+    /// The installed versionCode of the share app, or nil if not installed.
+    private func installedShareVersion(serial s: String) -> Int? {
+        guard let out = try? adb.run(serial: s, ["shell", "dumpsys", "package", Self.shareAppPackage]) else { return nil }
+        for line in out.split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.hasPrefix("versionCode=") {
+                // e.g. "versionCode=1 minSdk=29 targetSdk=35"
+                let rest = t.dropFirst("versionCode=".count)
+                let digits = rest.prefix { $0.isNumber }
+                return Int(digits)
+            }
+        }
+        return nil
+    }
+
+    /// Pull whatever is currently in the staging drop. Driven by the helper's
+    /// "file ready" signal (and once on connect) — no periodic polling.
+    func triggerDrain() {
+        drainOutbox()
     }
 
     // MARK: - Mac → device
@@ -202,8 +238,11 @@ final class FileTransfer: NSObject {
     func cancelCurrentTransfer() {
         pullLock.lock()
         let proc = currentPull
+        let fd = currentStreamFD
+        streamCancelled = true
         pullLock.unlock()
         proc?.terminate()
+        if let fd { close(fd) }   // unblocks the stream read loop
     }
 
     private func drainOutbox() {
@@ -214,9 +253,155 @@ final class FileTransfer: NSObject {
             // or removed), so a later file reusing the name is surfaced again.
             self.notifiedLarge.formIntersection(names)
             for name in names {
-                self.pullAndConsume(serial: s, name: name, auto: true)
+                if name == Self.streamMarker {
+                    // A share app wants to stream directly — consume the trigger
+                    // and receive over the socket (no device-side copy).
+                    self.adb.removeRemote(serial: s, path: "\(Self.remoteOutbox)/\(name)")
+                    self.receiveStream(serial: s)
+                } else {
+                    self.pullAndConsume(serial: s, name: name, auto: true)
+                }
             }
         }
+    }
+
+    // MARK: - Direct stream receive (device→Mac, no staging copy)
+
+    /// Runs on `ops`. Connects to the share app's socket via `adb forward` and
+    /// writes each streamed file straight into ~/Downloads — no device-side copy,
+    /// nothing to delete afterward.
+    private func receiveStream(serial s: String) {
+        guard let out = try? adb.run(serial: s, ["forward", "tcp:0", "localabstract:\(Self.streamSocket)"]),
+              let port = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            NSLog("zyncir: stream forward failed"); return
+        }
+        defer { _ = try? adb.run(serial: s, ["forward", "--remove", "tcp:\(port)"]) }
+
+        guard let fd = Self.connectLoopback(port: port) else {
+            NSLog("zyncir: stream connect failed"); return
+        }
+        pullLock.lock(); currentStreamFD = fd; streamCancelled = false; pullLock.unlock()
+        defer {
+            pullLock.lock(); currentStreamFD = nil; pullLock.unlock()
+            close(fd)
+        }
+
+        guard let count = Self.readInt32(fd), count > 0 else { return }
+        for _ in 0..<count {
+            guard let nameLen = Self.readUInt16(fd),
+                  let nameData = Self.readExactly(fd, Int(nameLen)),
+                  let name = String(data: nameData, encoding: .utf8),
+                  let total = Self.readInt64(fd) else { return }
+            if !receiveOneFile(fd: fd, rawName: name, total: total) { return }
+        }
+    }
+
+    /// Stream one file's `total` bytes (or to EOF if total < 0) into a `.part`
+    /// file, then finalize into ~/Downloads. Returns false to abort the batch.
+    private func receiveOneFile(fd: Int32, rawName: String, total: Int64) -> Bool {
+        let name = (rawName as NSString).lastPathComponent
+        guard !name.isEmpty, name != ".", name != ".." else { return false }
+        let dest = Self.uniqueDownloadURL(for: name)
+        let part = dest.appendingPathExtension("part")
+        try? FileManager.default.removeItem(at: part)
+        guard FileManager.default.createFile(atPath: part.path, contents: nil),
+              let fh = try? FileHandle(forWritingTo: part) else { return false }
+
+        let showUI = total >= Self.progressUIMinBytes
+        if showUI {
+            let partPath = part.path
+            DispatchQueue.main.async { [weak self] in
+                self?.startProgress(name: name, total: total, incoming: true) {
+                    Self.fileSize(atPath: partPath)
+                }
+            }
+        }
+
+        var received: Int64 = 0
+        var buf = [UInt8](repeating: 0, count: 262144)
+        var aborted = false
+        while total < 0 || received < total {
+            pullLock.lock(); let cancelled = streamCancelled; pullLock.unlock()
+            if cancelled { aborted = true; break }
+            let want = total < 0 ? buf.count : Int(min(Int64(buf.count), total - received))
+            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, want) }
+            if n <= 0 { break }
+            do { try fh.write(contentsOf: Data(buf[0..<n])) } catch { break }
+            received += Int64(n)
+        }
+        try? fh.close()
+        if showUI { DispatchQueue.main.async { [weak self] in self?.stopProgress() } }
+
+        let complete = !aborted && (total < 0 ? received > 0 : received == total)
+        guard complete else {
+            try? FileManager.default.removeItem(at: part)
+            DispatchQueue.main.async { [weak self] in self?.onTransferFinished?(name, false) }
+            return false
+        }
+        do {
+            try FileManager.default.moveItem(at: part, to: dest)
+        } catch {
+            NSLog("zyncir: stream finalize failed: \(error)")
+            try? FileManager.default.removeItem(at: part)
+            DispatchQueue.main.async { [weak self] in self?.onTransferFinished?(name, false) }
+            return false
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.onTransferFinished?(name, true)
+            self?.placeOnPasteboardAndNotify(dest)
+        }
+        return true
+    }
+
+    // MARK: - Blocking socket read helpers (loopback via adb forward)
+
+    private static func connectLoopback(port: Int) -> Int32? {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return nil }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(UInt16(truncatingIfNeeded: port)).bigEndian
+        addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let ok = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0
+            }
+        }
+        if !ok { close(fd); return nil }
+        return fd
+    }
+
+    private static func readExactly(_ fd: Int32, _ count: Int) -> Data? {
+        var data = Data(capacity: count)
+        var buf = [UInt8](repeating: 0, count: min(max(count, 1), 65536))
+        var remaining = count
+        while remaining > 0 {
+            let toRead = min(remaining, buf.count)
+            let n = buf.withUnsafeMutableBytes { read(fd, $0.baseAddress, toRead) }
+            if n <= 0 { return nil }
+            data.append(contentsOf: buf[0..<n])
+            remaining -= n
+        }
+        return data
+    }
+
+    private static func readUInt16(_ fd: Int32) -> UInt16? {
+        guard let d = readExactly(fd, 2) else { return nil }
+        return (UInt16(d[0]) << 8) | UInt16(d[1])
+    }
+
+    private static func readInt32(_ fd: Int32) -> Int? {
+        guard let d = readExactly(fd, 4) else { return nil }
+        var v: UInt32 = 0
+        for b in d { v = (v << 8) | UInt32(b) }
+        return Int(v)
+    }
+
+    private static func readInt64(_ fd: Int32) -> Int64? {
+        guard let d = readExactly(fd, 8) else { return nil }
+        var v: UInt64 = 0
+        for b in d { v = (v << 8) | UInt64(b) }
+        return Int64(bitPattern: v)
     }
 
     /// Runs on `ops`. Pulls one outbox entry, then deletes the device copy only
