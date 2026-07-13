@@ -504,6 +504,10 @@ extension FileTransfer: UNUserNotificationCenterDelegate {
         // here — reveal the file in either case.
         if let path = response.notification.request.content.userInfo["revealPath"] as? String {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            // activateFileViewerSelecting selects the file but doesn't focus
+            // Finder when the caller is a background/accessory app — bring it front.
+            NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder")
+                .first?.activate(options: [.activateAllWindows])
         }
         completionHandler()
     }
