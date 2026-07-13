@@ -39,9 +39,8 @@ final class FileTransfer: NSObject {
     /// The serial of the currently-synced transport, or nil. Touched only on `ops`.
     private var serial: String?
 
-    /// Notification id → file to reveal in Finder when the notification is tapped.
-    /// Main thread only.
-    private var revealByID: [String: URL] = [:]
+    private static let receivedCategory = "ZYNCIR_RECEIVED"
+    private static let revealAction = "ZYNCIR_REVEAL"
 
     /// Called on the main thread right after a received file is written to the
     /// pasteboard, so the clipboard bridge can suppress the resulting change.
@@ -97,6 +96,11 @@ final class FileTransfer: NSObject {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        let reveal = UNNotificationAction(identifier: Self.revealAction, title: "Show in Finder", options: [])
+        center.setNotificationCategories([
+            UNNotificationCategory(identifier: Self.receivedCategory, actions: [reveal],
+                                   intentIdentifiers: [], options: [])
+        ])
     }
 
     // MARK: - Connection lifecycle (called by AppController)
@@ -473,8 +477,14 @@ final class FileTransfer: NSObject {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        if let revealURL {
+            // Carry the path in userInfo (not an in-memory map) so tapping the
+            // banner — or the "Show in Finder" action — reveals the file even
+            // after zyncir has relaunched.
+            content.userInfo = ["revealPath": revealURL.path]
+            content.categoryIdentifier = Self.receivedCategory
+        }
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        if let revealURL { revealByID[request.identifier] = revealURL }
         UNUserNotificationCenter.current().add(request)
     }
 }
@@ -490,9 +500,10 @@ extension FileTransfer: UNUserNotificationCenterDelegate {
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler: @escaping () -> Void) {
-        let id = response.notification.request.identifier
-        if let url = revealByID.removeValue(forKey: id) {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+        // Both a banner tap (default action) and the "Show in Finder" button land
+        // here — reveal the file in either case.
+        if let path = response.notification.request.content.userInfo["revealPath"] as? String {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
         }
         completionHandler()
     }
