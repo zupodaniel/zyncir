@@ -1,10 +1,10 @@
 # zyncir — macOS ↔ Android - clipboard sync
 
 A focused menu-bar utility that keeps the **macOS** and **Android** clipboards in
-sync, both directions, over Wireless Debugging — and moves files between the two.
-Pair once; it auto-reconnects on the LAN whenever the phone is reachable. It stays
-deliberately small: clipboard sync, simple file transfer, and autoconnect, with
-screen mirroring delegated to scrcpy.
+sync, both directions, over Wireless Debugging — and moves files between the two,
+including a **Share → zyncir** target on the phone. Pair once; it auto-reconnects
+on the LAN whenever the phone is reachable. It stays deliberately small: clipboard
+sync, file transfer, and autoconnect, with screen mirroring delegated to scrcpy.
 
 ## Why this exists
 
@@ -89,12 +89,19 @@ macOS menu-bar app                          Android 15+
         NSPasteboard ⇄ TCP (len-prefixed UTF-8) ⇄ app_process helper
                                               FakeContext → ClipboardManager
                                               OnPrimaryClipChangedListener
+  Files ────── adb forward tcp:0 ────────▶ localabstract:zyncir-share
+        ~/Downloads ⇄ TCP (len-prefixed) ⇄ Share app (foreground service)
 ```
 
 - **Transport:** adb over Wireless Debugging. Discovery uses adb's built-in mDNS
   (macOS `mDNSResponder` is always-on); the connect port is randomized per
   session, so the device's stable mDNS instance name is the identity.
 - **Helper launch:** `adb shell CLASSPATH=/data/local/tmp/zyncir.jar app_process / com.zyncir.Server`
+- **File transfer:** Mac→device is `adb push`; device→Mac is the **Share → zyncir**
+  app, which streams file bytes over `localabstract:zyncir-share` (read by the Mac
+  via `adb forward`) straight into `~/Downloads` — no on-device copy. The helper
+  watches the phone for the app's trigger and nudges the Mac over
+  `localabstract:zyncir-files` so it connects and reads the stream.
 - **Loop guard:** both ends track the last value synced in each direction and
   suppress echoes, so a copy does not ping-pong.
 - **Privacy:** clipboard content and transferred files travel only over the local
@@ -107,40 +114,45 @@ macOS menu-bar app                          Android 15+
 
 ## File transfer
 
-Alongside the clipboard, zyncir moves whole files over the same adb connection
-(via `adb push`/`adb pull` — file bytes never touch the clipboard channel). Two
-device folders under Downloads are created automatically while connected:
-
-- `Download/zyncir/` — files **sent from the Mac** land here.
-- `Download/zyncir/send/` — drop a file here **on the phone** (Files app → *Move
-  to* / *Copy to*) to send it to the Mac.
+Alongside the clipboard, zyncir moves whole files over the same adb connection —
+file bytes never touch the clipboard channel.
 
 **Mac → Android:** menu **Send file(s) to device…** → pick one or more files;
-they're pushed to `Download/zyncir/` (a best-effort media scan makes images/video
-show up in Gallery).
+they're `adb push`ed to `Download/zyncir/` on the phone (a best-effort media scan
+makes images/video show up in Gallery).
 
-**Android → Mac:** while connected, zyncir watches `Download/zyncir/send/` (~2 s),
-pulls any new file into `~/Downloads` (never overwriting — it appends " (2)",
-" (3)", …), removes the device copy, drops the file on the Mac clipboard so you
-can paste it immediately, and posts a notification (tap it to reveal the file in
-Finder). Files larger than **100 MB** are not pulled automatically — a
-notification with a **Download** action surfaces them instead, so a large transfer
-stays behind an explicit tap.
+**Android → Mac:** use the phone's **Share** sheet → **zyncir** from any app
+(gallery, files, browser). The shared file(s) **stream directly** to `~/Downloads`
+over the adb connection — nothing is copied into a folder on the phone first, and
+there is **no size limit**. Each received file is placed on the Mac clipboard (so
+you can paste it immediately, never overwriting — it appends " (2)", " (3)", …),
+and a notification lets you reveal it in Finder (tap the banner or its **Show in
+Finder** action). Sizeable transfers show a floating progress window with a
+**Cancel**.
+
+The "zyncir" share target comes from a tiny companion app (`com.zyncir.share`)
+that zyncir **installs and updates automatically over adb** whenever a device
+connects — no manual install. Because it streams live, sharing requires the phone
+to be connected to the Mac at that moment.
 
 ## Coexistence with Android Studio / scrcpy
 
-Designed to be a well-behaved adb citizen:
+Designed to share adb cleanly with your IDE in steady state:
 
 - **Reuses your existing `adb`** (resolved from `$ANDROID_HOME`/`$ANDROID_SDK_ROOT`/
-  `~/Library/Android/sdk`/`PATH`), so the shared adb server is never killed by a
-  version mismatch. Override with the `ADB` env var if needed.
+  `~/Library/Android/sdk`/`PATH`), so client/server versions always match.
+  Override with the `ADB` env var if needed.
 - **Always `adb -s <serial> …`**, so it never hijacks the IDE's selected device
   or trips "more than one device" when the phone is also on USB.
-- Uses a unique `localabstract:zyncir` socket (scrcpy uses `scrcpy`) and an
-  OS-allocated forward port. It **never** kills the adb server on its own; if the
-  IDE restarts the server, zyncir just reconnects. (A manual **Restart adb server**
-  menu item reclaims the server under zyncir and reconnects, if a terminal/IDE
-  respawned it under an owner without Local Network access.)
+- Uses unique `localabstract` sockets — `zyncir` (clipboard), `zyncir-files`
+  (share signal), `zyncir-share` (share stream); scrcpy uses `scrcpy` — with
+  OS-allocated forward ports.
+- **On launch, zyncir restarts the adb server from itself** (as Android Studio
+  does on open) so it becomes the server's *responsible process* and reliably
+  holds the macOS Local Network grant that wireless adb needs. This costs a
+  one-time reconnect blip to any other adb client already running (the IDE
+  re-attaches its devices a moment later); the **Restart adb server** menu item
+  does the same on demand.
 
 ## Menu
 
@@ -152,7 +164,8 @@ and these actions:
 - **Select device (N)…** — pick which connected device to sync with; `N` is how many are available.
 - **Pair new device (Wi-Fi)…** — first-time Wireless-debugging pairing by code.
 - **Forget device** — clear the saved pairing (shown when a device is paired).
-- **Restart adb server** — kill the adb server and restart it *from zyncir* (so the new server is owned by the signed app and keeps Local Network access for wireless adb), then reconnect. Use it to reclaim adb after a terminal/IDE respawned the server.
+- **Disconnect devices…** — `adb disconnect` chosen wireless devices (multi-select); clears the saved pairing if the synced device is among them.
+- **Restart adb server** — kill the adb server and restart it *from zyncir* (so the new server is owned by the signed app and keeps Local Network access for wireless adb), then reconnect. zyncir also does this automatically on launch; the menu item is for reclaiming adb on demand after a terminal/IDE respawned the server.
 - **Quit zyncir**.
 
 ## Functions
@@ -161,13 +174,14 @@ and these actions:
 - **Android → Mac:** copy text on the phone (app not focused); `pbpaste` on the Mac shows it within ~1 s.
 - **Mac → Android:** `pbcopy` on the Mac; paste into a phone text field.
 - **Mac → Android files:** **Send file(s) to device…**, pick a file; it appears in the phone's Files app under `Download/zyncir/`.
-- **Android → Mac files:** move a file into `Download/zyncir/send/` on the phone; within ~2 s it lands in `~/Downloads` and on the Mac clipboard.
+- **Android → Mac files:** **Share → zyncir** from any app on the phone; the file streams straight to `~/Downloads` and onto the Mac clipboard.
 - **Loop guard:** copy once on each side; the value must not ping-pong or duplicate.
 - **Autoconnect:** toggle the phone's Wi-Fi off/on; the app returns to *Connected* with no re-pairing.
 - **Restart resilience:** quit and relaunch the app; it reconnects automatically.
 - **Power:** with the helper running idle, `adb shell top -n 1 | grep app_process` shows it is not busy-looping.
-- **Coexistence:** with Android Studio open and a USB device attached, start zyncir over wireless; `adb devices`
-   shows both transports, no "version doesn't match / killing server" appears, and a running scrcpy session is unaffected.
+- **Coexistence:** with Android Studio open and a USB device attached, launch zyncir; it restarts the adb server
+   once (the IDE's devices re-attach a moment later), then both transports coexist — every zyncir command is
+   `adb -s <serial>`, so it never trips "more than one device" or a client/server version mismatch.
 
 ## Licensing
 
