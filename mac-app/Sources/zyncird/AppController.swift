@@ -95,7 +95,11 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         buildMenu()
         refreshUI()
-        startAutoConnect()
+        // Reclaim the adb server under zyncir on launch (as Android Studio ensures/
+        // restarts it), so zyncir is the server's responsible app and owns the
+        // Local Network grant wireless adb needs — then begin autoconnect. Costs a
+        // one-time reconnect blip to any other adb client already running.
+        reclaimAdbServer { [weak self] in self?.startAutoConnect() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -386,12 +390,23 @@ final class AppController: NSObject, NSApplicationDelegate {
     /// unauthorized owner. Doing kill + start back-to-back here wins the race
     /// against a terminal adb client respawning it first.
     @objc private func restartAdbServer() {
+        reclaimAdbServer()
+    }
+
+    /// Kill and immediately restart the adb server from zyncir so zyncir is its
+    /// responsible app (carrying the Local Network grant). Runs on `work`; on
+    /// completion calls `then` on the main thread, or forces a reconnect if nil.
+    private func reclaimAdbServer(then: (() -> Void)? = nil) {
         work.async { [weak self] in
             guard let self else { return }
             _ = try? self.adb.run(["kill-server"])
             _ = try? self.adb.run(["start-server"])
-            NSLog("zyncir: adb server restarted (owned by zyncir); forcing reconnect")
-            self.tickAutoConnect()
+            NSLog("zyncir: adb server (re)started (owned by zyncir)")
+            if let then {
+                DispatchQueue.main.async(execute: then)
+            } else {
+                self.tickAutoConnect()
+            }
         }
     }
 
