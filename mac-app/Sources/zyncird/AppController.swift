@@ -29,11 +29,19 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var unpairItem: NSMenuItem!
     private var mirrorItem: NSMenuItem!
     private var sendFilesItem: NSMenuItem!
+    private var persistItem: NSMenuItem!
+    private var stopPersistItem: NSMenuItem!
+    private var persistSeparator: NSMenuItem!
     private var mirrorSeparator: NSMenuItem!
 
     // Count of selectable devices, refreshed by the autoconnect tick; shown on
     // the "Select device" item.
     private var availableDeviceCount = 0
+
+    // Persistent-connection (fixed-port) menu state, refreshed by the autoconnect
+    // tick from the live transport list. Mutually exclusive: at most one is true.
+    private var canCreatePersistent = false
+    private var persistentActive = false
 
     // MARK: - Lifecycle
 
@@ -146,15 +154,27 @@ final class AppController: NSObject, NSApplicationDelegate {
             // autoconnect below.
             let devices = self.adb.listDevices()
             let count = self.candidateDevices(from: devices).count
+
+            // Persistent-connection menu state, derived from the same device list:
+            // "active" when the fixed-port endpoint is a live transport; "can create"
+            // when some other transport is up and no fixed-port link exists yet.
+            let paired = self.paired
+            let active = paired.map { self.fixedPortActive(for: $0, devices: devices) } ?? false
+            let canCreate: Bool = {
+                guard let paired, !active else { return false }
+                return self.targetSerial(for: paired, devices: devices) != nil
+            }()
+
             DispatchQueue.main.async {
-                if self.availableDeviceCount != count {
-                    self.availableDeviceCount = count
-                    self.refreshUI()
-                }
+                var changed = false
+                if self.availableDeviceCount != count { self.availableDeviceCount = count; changed = true }
+                if self.canCreatePersistent != canCreate { self.canCreatePersistent = canCreate; changed = true }
+                if self.persistentActive != active { self.persistentActive = active; changed = true }
+                if changed { self.refreshUI() }
             }
 
             // Read the target fresh: a device selection may have just changed it.
-            guard let paired = self.paired else { return }
+            guard let paired else { return }
 
             // Primary: modern adb auto-connects paired wireless devices, so just
             // find our device among the connected transports (reliable, unlike
@@ -225,6 +245,15 @@ final class AppController: NSObject, NSApplicationDelegate {
             return usb?.serial ?? wifi?.serial
         }
         return wifi?.serial ?? usb?.serial
+    }
+
+    /// True when the paired device is reachable right now through its fixed-port
+    /// (5555) endpoint — i.e. a persistent connection is live. Checks the live
+    /// transport list rather than the stored `lastKnownHost` flag, which outlives a
+    /// phone reboot (the port closes on reboot, but the flag lingers).
+    private func fixedPortActive(for paired: PairedDevice, devices: [Adb.DeviceEntry]) -> Bool {
+        guard let host = paired.lastKnownHost else { return false }
+        return devices.contains { $0.state == "device" && $0.serial == host }
     }
 
     /// Find the connect service for the paired device, most specific first:
@@ -448,6 +477,84 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Explain, then on consent create a "persistent connection": switch the paired
+    /// device to a fixed adb port so clipboard sync, file transfer and mirroring keep
+    /// working over a stable ip:port. Honest about the trade-off — the port stays open
+    /// until the phone reboots — so the user is choosing it knowingly.
+    @objc private func createPersistentConnection() {
+        guard let paired = paired else {
+            infoAlert("No device selected", "Select a device first, then create a persistent connection.")
+            return
+        }
+        let name = paired.label ?? "device"
+        guard confirmAlert(
+            title: "Create a persistent connection?",
+            message: "This pins “\(name)” to a stable Wi‑Fi address so clipboard sync, file "
+                + "transfer and screen mirroring keep working reliably, even when the device's "
+                + "auto-assigned adb name changes.\n\n"
+                + "Under the hood it opens adb port 5555 on the phone. The connection stays "
+                + "active even if the phone's “Wireless debugging” switch shows off, and lasts "
+                + "until the phone reboots. While active, that port is reachable by other devices "
+                + "on any Wi‑Fi network the phone joins (still gated by adb key authorization).",
+            confirmTitle: "Create") else { return }
+        establishFixedPort(for: paired) { [weak self] endpoint, err in
+            guard let self else { return }
+            if let endpoint {
+                self.infoAlert("Persistent connection created",
+                               "“\(name)” is now reachable at \(endpoint) and will reconnect "
+                               + "automatically until the phone reboots.")
+            } else {
+                self.infoAlert("Couldn't create persistent connection", err ?? "Unknown error.")
+            }
+        }
+    }
+
+    /// Counterpart to createPersistentConnection: revert the device's adbd to
+    /// USB-only (`adb usb`), closing port 5555, then disconnect the fixed-port
+    /// endpoint and forget it so autoconnect falls back to the normal transport.
+    @objc private func stopPersistentConnection() {
+        guard let paired = paired else { return }
+        let name = paired.label ?? "device"
+        guard confirmAlert(
+            title: "Stop the persistent connection?",
+            message: "This closes adb port 5555 on “\(name)” and reverts it to USB‑only adb. "
+                + "Clipboard sync and file transfer keep working over the device's normal "
+                + "wireless transport; only the fixed-port endpoint goes away. You can re-create "
+                + "the persistent connection at any time.",
+            confirmTitle: "Stop") else { return }
+        work.async { [weak self] in
+            guard let self else { return }
+            func finish(_ message: String) {
+                var updated = paired
+                updated.lastKnownHost = nil
+                DispatchQueue.main.async {
+                    self.paired = updated
+                    DeviceStore.save(updated)
+                    self.tickAutoConnect()
+                    self.refreshUI()
+                    self.infoAlert("Persistent connection stopped", message)
+                }
+            }
+            let devices = self.adb.listDevices()
+            guard let target = self.targetSerial(for: paired, devices: devices) else {
+                finish("Couldn't reach “\(name)” to close the port — it may already be offline. "
+                       + "The fixed-port endpoint has been forgotten; the port closes on the next reboot.")
+                return
+            }
+            do {
+                try self.adb.usb(serial: target)
+            } catch {
+                finish("Couldn't revert “\(name)” to USB adb (\(error)). "
+                       + "The fixed-port endpoint has been forgotten; the port closes on the next reboot.")
+                return
+            }
+            if let host = paired.lastKnownHost {
+                _ = try? self.adb.run(["disconnect", host])
+            }
+            finish("Port 5555 on “\(name)” has been closed and the fixed-port endpoint forgotten.")
+        }
+    }
+
     /// Launch scrcpy against the current device, preferring its USB transport
     /// (smoother than Wi-Fi) regardless of the clipboard transport pin.
     @objc private func mirrorScreen() {
@@ -644,6 +751,23 @@ final class AppController: NSObject, NSApplicationDelegate {
         unpairItem.target = self
         menu.addItem(unpairItem)
 
+        // Persistent-connection group — fixed-port (5555) create/stop, kept apart
+        // from the everyday device actions since they change the device's adb state.
+        // Hidden until the first autoconnect tick resolves which one applies.
+        persistSeparator = NSMenuItem.separator()
+        persistSeparator.isHidden = true
+        menu.addItem(persistSeparator)
+
+        persistItem = NSMenuItem(title: "Create persistent connection…", action: #selector(createPersistentConnection), keyEquivalent: "")
+        persistItem.target = self
+        persistItem.isHidden = true
+        menu.addItem(persistItem)
+
+        stopPersistItem = NSMenuItem(title: "Stop persistent connection…", action: #selector(stopPersistentConnection), keyEquivalent: "")
+        stopPersistItem.target = self
+        stopPersistItem.isHidden = true
+        menu.addItem(stopPersistItem)
+
         mirrorSeparator = NSMenuItem.separator()   // closes the connected-device group
         menu.addItem(mirrorSeparator)
 
@@ -695,6 +819,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         let connected = (bridgeState == .connected)
         mirrorItem.isEnabled = connected
         sendFilesItem.isEnabled = connected
+        // Show exactly one of the persistent-connection actions, per the live check
+        // in tickAutoConnect: Create when a convertible transport is up and no
+        // fixed-port link exists, Stop when the fixed-port link is live. Hide the
+        // group's separator when neither applies (e.g. device offline).
+        persistItem.isHidden = !canCreatePersistent
+        stopPersistItem.isHidden = !persistentActive
+        persistSeparator.isHidden = !(canCreatePersistent || persistentActive)
         // Forgetting only needs a stored pairing — allowed even when offline.
         unpairItem.isEnabled = (paired != nil)
 

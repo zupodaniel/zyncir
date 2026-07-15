@@ -157,6 +157,12 @@ struct Adb {
         _ = try run(serial: serial, ["tcpip", "\(port)"])
     }
 
+    /// Revert a device's adbd to USB-only (`adb usb`), closing the fixed TCP port
+    /// opened by `tcpip`. The wireless listener stays gone until the next `tcpip`.
+    func usb(serial: String) throws {
+        _ = try run(serial: serial, ["usb"])
+    }
+
     // MARK: - File transfer
 
     /// Push a local file to the device.
